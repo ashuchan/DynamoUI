@@ -1,0 +1,7 @@
+adapters:
+  - key: postgresql
+    type: postgresql
+    host: localhost
+    port: 5432
+    database: dynamoui
+    description: Default PostgreSQL adapter

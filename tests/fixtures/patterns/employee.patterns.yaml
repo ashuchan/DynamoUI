@@ -1,0 +1,35 @@
+# skill_hash: placeholder1234
+entity: Employee
+patterns:
+  - id: employee.active
+    description: Show all active employees
+    triggers:
+      - active employees
+      - employees currently active
+      - show active staff
+      - list active employees
+    query_template: '{"filters": [{"field": "is_active", "op": "eq", "value": true}]}'
+    params: []
+
+  - id: employee.by_department
+    description: Filter employees by department
+    triggers:
+      - employees in department
+      - staff in department
+      - show department employees
+    query_template: '{"filters": [{"field": "department", "op": "eq", "value": "{department}"}]}'
+    params:
+      - name: department
+        type: enum
+        enumRef: Department
+        required: true
+
+  - id: employee.contractors
+    description: Show all contractors
+    triggers:
+      - contractors
+      - contract employees
+      - show contractors
+      - all contract workers
+    query_template: '{"filters": [{"field": "employment_type", "op": "eq", "value": "CONTRACT"}]}'
+    params: []

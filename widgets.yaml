@@ -1,0 +1,32 @@
+widgets:
+  - id: active_employees
+    title: Active Employees
+    description: Show all currently active employees
+    entity: Employee
+    pattern_id: employee.active
+    category: HR
+    icon: users
+    params: []
+
+  - id: engineering_team
+    title: Engineering Team
+    description: Show all engineers
+    entity: Employee
+    pattern_id: employee.by_department
+    category: HR
+    icon: code
+    params:
+      - name: department
+        type: enum
+        enumRef: Department
+        required: true
+        default: ENGINEERING
+
+  - id: all_contractors
+    title: All Contractors
+    description: List all contract employees
+    entity: Employee
+    pattern_id: employee.contractors
+    category: HR
+    icon: briefcase
+    params: []

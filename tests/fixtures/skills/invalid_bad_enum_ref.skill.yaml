@@ -1,0 +1,13 @@
+entity: BadEnumRef
+table: bad_enum_ref
+adapter: postgresql
+description: Field has enumRef but no matching enum — Phase 2 cross-ref failure
+fields:
+  - name: id
+    type: uuid
+    isPK: true
+    nullable: false
+  - name: status
+    type: enum
+    enumRef: NonExistentEnum
+    nullable: false

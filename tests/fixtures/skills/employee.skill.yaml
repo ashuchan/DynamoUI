@@ -1,0 +1,87 @@
+entity: Employee
+table: employees
+adapter: postgresql
+description: Employee records for the HR system
+schema_name: public
+fields:
+  - name: id
+    type: uuid
+    isPK: true
+    nullable: false
+    label: Employee ID
+  - name: first_name
+    type: string
+    nullable: false
+    label: First Name
+    max_length: 100
+  - name: last_name
+    type: string
+    nullable: false
+    label: Last Name
+    max_length: 100
+  - name: email
+    type: string
+    nullable: false
+    label: Email Address
+    max_length: 255
+  - name: employment_type
+    type: enum
+    enumRef: EmploymentType
+    nullable: false
+    label: Employment Type
+  - name: department
+    type: enum
+    enumRef: Department
+    nullable: true
+    label: Department
+  - name: salary
+    type: float
+    nullable: true
+    label: Salary
+    sensitive: true
+  - name: hire_date
+    type: date
+    nullable: false
+    label: Hire Date
+  - name: is_active
+    type: boolean
+    nullable: false
+    label: Active
+  - name: manager_id
+    type: uuid
+    nullable: true
+    label: Manager
+    fk:
+      entity: Employee
+      field: id
+      display_field: first_name
+display:
+  default_sort_field: last_name
+  default_sort_dir: asc
+  columns_visible:
+    - id
+    - first_name
+    - last_name
+    - email
+    - employment_type
+    - department
+    - is_active
+  detail_fields:
+    - id
+    - first_name
+    - last_name
+    - email
+    - employment_type
+    - department
+    - hire_date
+    - is_active
+    - manager_id
+  searchable_fields:
+    - first_name
+    - last_name
+    - email
+  page_size: 25
+mutations_file: ""
+patterns_file: ""
+read_permissions: []
+write_permissions: []

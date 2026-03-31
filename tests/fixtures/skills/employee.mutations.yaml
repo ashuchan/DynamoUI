@@ -1,0 +1,48 @@
+entity: Employee
+mutations:
+  - id: employee.create
+    operation: create
+    description: Create a new employee record
+    fields:
+      - first_name
+      - last_name
+      - email
+      - employment_type
+      - department
+      - hire_date
+      - is_active
+    validation_rules:
+      - field: first_name
+        rule: required
+        message: First name is required
+      - field: last_name
+        rule: required
+        message: Last name is required
+      - field: email
+        rule: required
+        message: Email is required
+    requires_confirmation: true
+
+  - id: employee.update
+    operation: update
+    description: Update an existing employee record
+    fields:
+      - first_name
+      - last_name
+      - email
+      - employment_type
+      - department
+      - is_active
+    requires_confirmation: true
+
+  - id: employee.deactivate
+    operation: update
+    description: Deactivate an employee (soft delete)
+    fields:
+      - is_active
+    requires_confirmation: true
+
+  - id: employee.delete
+    operation: delete
+    description: Permanently delete an employee record
+    requires_confirmation: true
