@@ -16,15 +16,26 @@ To get started with DynamoUI, follow these steps:
    git clone https://github.com/ashuchan/DynamoUI.git
    cd DynamoUI
    ```
-2. Install the required dependencies:
+2. Start a virtual environment:
    ```
-   npm install
+   python -m venv venv
    ```
-3. Start the development server:
+3. Activate the virtual environment:
    ```
-   npm start
+   .\venv\Scripts\activate
    ```
-4. Open your browser and navigate to `http://localhost:3000`.
+4. Upgrade python
+   ```
+   python -m pip install --upgrade pip setuptools wheel
+   ```
+5. Install project dependencies
+   ```
+   pip install -e ".[dev]"
+   ```
+6. Test the build
+   ```
+   python -m pytest --cov
+   ```
 
 ## Features
 - **Responsive Design**: Components are designed to adapt to various screen sizes.
