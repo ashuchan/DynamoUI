@@ -14,7 +14,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class SkillRegistrySettings(BaseSettings):
     """DYNAMO_SKILL_* environment variables."""
 
-    model_config = SettingsConfigDict(env_prefix="DYNAMO_SKILL_", case_sensitive=False)
+    model_config = SettingsConfigDict(
+        env_prefix="DYNAMO_SKILL_",
+        case_sensitive=False,
+        env_file=".env",
+        env_file_encoding="utf-8",
+    )
 
     skills_dir: str = Field("./skills", description="*.skill.yaml discovery root")
     enums_dir: str = Field("./enums", description="*.enum.yaml discovery root")
@@ -52,7 +57,12 @@ class SkillRegistrySettings(BaseSettings):
 class PostgreSQLSettings(BaseSettings):
     """DYNAMO_PG_* environment variables."""
 
-    model_config = SettingsConfigDict(env_prefix="DYNAMO_PG_", case_sensitive=False)
+    model_config = SettingsConfigDict(
+        env_prefix="DYNAMO_PG_",
+        case_sensitive=False,
+        env_file=".env",
+        env_file_encoding="utf-8",
+    )
 
     host: str = Field("localhost")
     port: int = Field(5432)
@@ -94,7 +104,12 @@ class PostgreSQLSettings(BaseSettings):
 class PatternCacheSettings(BaseSettings):
     """DYNAMO_CACHE_* environment variables."""
 
-    model_config = SettingsConfigDict(env_prefix="DYNAMO_CACHE_", case_sensitive=False)
+    model_config = SettingsConfigDict(
+        env_prefix="DYNAMO_CACHE_",
+        case_sensitive=False,
+        env_file=".env",
+        env_file_encoding="utf-8",
+    )
 
     fuzzy_threshold: float = Field(
         0.90, description="Minimum score for a cache hit (0.0–1.0)"

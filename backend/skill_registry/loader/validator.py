@@ -221,7 +221,7 @@ def _detect_circular_fks(
         in_stack.add(node)
         path.append(node)
         for _, target, _ in fk_graph.get(node, []):
-            if target in entity_names:
+            if target in entity_names and target != node:
                 dfs(target, path)
         path.pop()
         in_stack.discard(node)

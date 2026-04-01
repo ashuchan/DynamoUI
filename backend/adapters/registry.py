@@ -67,6 +67,7 @@ async def initialise_adapters(
             from backend.adapters.postgresql.adapter import PostgreSQLAdapter
 
             adapter = PostgreSQLAdapter(adapter_key=entry.key, settings=pg_settings)
+            await adapter.initialise()
             register_adapter(adapter)
         else:
             log.warning(

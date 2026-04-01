@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import pytest
 import sqlalchemy as sa
+import sqlalchemy.dialects.postgresql
 
 from backend.adapters.base import FilterClause, MutationPlan, QueryPlan, SortClause
 from backend.adapters.postgresql.diff_builder import DiffBuilder
