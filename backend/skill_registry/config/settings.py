@@ -19,6 +19,7 @@ class SkillRegistrySettings(BaseSettings):
         case_sensitive=False,
         env_file=".env",
         env_file_encoding="utf-8",
+        extra="ignore",
     )
 
     skills_dir: str = Field("./skills", description="*.skill.yaml discovery root")
@@ -62,6 +63,7 @@ class PostgreSQLSettings(BaseSettings):
         case_sensitive=False,
         env_file=".env",
         env_file_encoding="utf-8",
+        extra="ignore",
     )
 
     host: str = Field("localhost")
@@ -88,16 +90,18 @@ class PostgreSQLSettings(BaseSettings):
 
     @property
     def read_url(self) -> str:
+        from urllib.parse import quote_plus
         return (
-            f"postgresql+asyncpg://{self.user}:"
-            f"{self.password.get_secret_value()}@{self.host}:{self.port}/{self.database}"
+            f"postgresql+asyncpg://{quote_plus(self.user)}:"
+            f"{quote_plus(self.password.get_secret_value())}@{self.host}:{self.port}/{self.database}"
         )
 
     @property
     def write_url(self) -> str:
+        from urllib.parse import quote_plus
         return (
-            f"postgresql+asyncpg://{self.write_user}:"
-            f"{self.write_password.get_secret_value()}@{self.host}:{self.port}/{self.database}"
+            f"postgresql+asyncpg://{quote_plus(self.write_user)}:"
+            f"{quote_plus(self.write_password.get_secret_value())}@{self.host}:{self.port}/{self.database}"
         )
 
 
@@ -109,6 +113,7 @@ class PatternCacheSettings(BaseSettings):
         case_sensitive=False,
         env_file=".env",
         env_file_encoding="utf-8",
+        extra="ignore",
     )
 
     fuzzy_threshold: float = Field(

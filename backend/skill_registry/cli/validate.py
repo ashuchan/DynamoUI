@@ -179,30 +179,37 @@ def scaffold_command(
     dry_run: bool,
 ) -> None:
     """Generate skill YAML from a live PostgreSQL table or schema."""
+    from backend.adapters.registry import initialise_adapters
+    from backend.skill_registry.config.settings import pg_settings, skill_settings
     from backend.skill_registry.scaffold.scaffolder import scaffold_schema, scaffold_table
 
-    if table:
-        yaml_content = asyncio.run(scaffold_table(adapter, table, schema))
-        if dry_run:
-            click.echo(yaml_content)
-        elif output_path:
-            Path(output_path).write_text(yaml_content, encoding="utf-8")
-            click.echo(f"Written to {output_path}")
+    async def _run() -> None:
+        await initialise_adapters(skill_settings.adapters_registry, pg_settings)
+
+        if table:
+            yaml_content = await scaffold_table(adapter, table, schema)
+            if dry_run:
+                click.echo(yaml_content)
+            elif output_path:
+                Path(output_path).write_text(yaml_content, encoding="utf-8")
+                click.echo(f"Written to {output_path}")
+            else:
+                click.echo(yaml_content)
+        elif output_dir:
+            out_dir = Path(output_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            results = await scaffold_schema(adapter, schema, out_dir if not dry_run else None)
+            if dry_run:
+                for tbl, content in results.items():
+                    click.echo(f"--- {tbl}.skill.yaml ---")
+                    click.echo(content)
+            else:
+                click.echo(f"Scaffolded {len(results)} table(s) to {output_dir}")
         else:
-            click.echo(yaml_content)
-    elif output_dir:
-        out_dir = Path(output_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        results = asyncio.run(scaffold_schema(adapter, schema, out_dir if not dry_run else None))
-        if dry_run:
-            for tbl, content in results.items():
-                click.echo(f"--- {tbl}.skill.yaml ---")
-                click.echo(content)
-        else:
-            click.echo(f"Scaffolded {len(results)} table(s) to {output_dir}")
-    else:
-        click.echo("ERROR: provide --table or --output-dir", err=True)
-        sys.exit(1)
+            click.echo("ERROR: provide --table or --output-dir", err=True)
+            sys.exit(1)
+
+    asyncio.run(_run())
 
 
 # ---------------------------------------------------------------------------

@@ -40,12 +40,11 @@ class SchemaInspector:
                 )
             )
             pk_cols = await conn.run_sync(
-                lambda sync_conn: {
-                    c["name"]
-                    for c in inspect(sync_conn).get_pk_constraint(
+                lambda sync_conn: set(
+                    inspect(sync_conn).get_pk_constraint(
                         table_name, schema=schema_name
                     ).get("constrained_columns", [])
-                }
+                )
             )
 
         columns = []
