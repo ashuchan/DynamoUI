@@ -187,24 +187,39 @@ def scaffold_command(
         await initialise_adapters(skill_settings.adapters_registry, pg_settings)
 
         if table:
-            yaml_content = await scaffold_table(adapter, table, schema)
-            if dry_run:
-                click.echo(yaml_content)
-            elif output_path:
-                Path(output_path).write_text(yaml_content, encoding="utf-8")
-                click.echo(f"Written to {output_path}")
+            output = await scaffold_table(adapter, table, schema)
+            if dry_run or not output_path:
+                click.echo(output.skill_yaml)
+                click.echo(f"--- {table}.patterns.yaml ---")
+                click.echo(output.patterns_yaml)
             else:
-                click.echo(yaml_content)
+                skill_p = Path(output_path)
+                skill_p.write_text(output.skill_yaml, encoding="utf-8")
+                patterns_p = skill_p.parent / f"{table}.patterns.yaml"
+                patterns_p.write_text(output.patterns_yaml, encoding="utf-8")
+                widgets_p = skill_p.parent / "widgets.yaml"
+                import yaml as _yaml
+                existing: list = []
+                if widgets_p.exists():
+                    existing = (_yaml.safe_load(widgets_p.read_text(encoding="utf-8")) or {}).get("widgets", [])
+                existing.extend(output.widgets)
+                widgets_p.write_text(
+                    _yaml.dump({"widgets": existing}, default_flow_style=False, sort_keys=False, allow_unicode=True),
+                    encoding="utf-8",
+                )
+                click.echo(f"Written: {skill_p}, {patterns_p}, {widgets_p}")
         elif output_dir:
             out_dir = Path(output_dir)
             out_dir.mkdir(parents=True, exist_ok=True)
             results = await scaffold_schema(adapter, schema, out_dir if not dry_run else None)
             if dry_run:
-                for tbl, content in results.items():
+                for tbl, output in results.items():
                     click.echo(f"--- {tbl}.skill.yaml ---")
-                    click.echo(content)
+                    click.echo(output.skill_yaml)
+                    click.echo(f"--- {tbl}.patterns.yaml ---")
+                    click.echo(output.patterns_yaml)
             else:
-                click.echo(f"Scaffolded {len(results)} table(s) to {output_dir}")
+                click.echo(f"Scaffolded {len(results)} table(s) to {output_dir} (skill, patterns, widgets)")
         else:
             click.echo("ERROR: provide --table or --output-dir", err=True)
             sys.exit(1)

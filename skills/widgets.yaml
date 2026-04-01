@@ -1,0 +1,265 @@
+widgets:
+- id: artist_list_all
+  title: Artist — List All
+  description: List all Artist records
+  entity: Artist
+  pattern_id: artist.list_all
+  category: '# TODO: set category'
+  icon: table
+  params: []
+- id: artist_by_name
+  title: Artist — By Name
+  description: Search Artist by Name
+  entity: Artist
+  pattern_id: artist.by_name
+  category: '# TODO: set category'
+  icon: table
+  params:
+  - name: name
+    type: string
+    required: true
+- id: album_list_all
+  title: Album — List All
+  description: List all Album records
+  entity: Album
+  pattern_id: album.list_all
+  category: '# TODO: set category'
+  icon: table
+  params: []
+- id: album_by_title
+  title: Album — By Title
+  description: Search Album by Title
+  entity: Album
+  pattern_id: album.by_title
+  category: '# TODO: set category'
+  icon: table
+  params:
+  - name: title
+    type: string
+    required: true
+- id: employee_list_all
+  title: Employee — List All
+  description: List all Employee records
+  entity: Employee
+  pattern_id: employee.list_all
+  category: '# TODO: set category'
+  icon: table
+  params: []
+- id: employee_by_lastname
+  title: Employee — By Lastname
+  description: Search Employee by LastName
+  entity: Employee
+  pattern_id: employee.by_lastname
+  category: '# TODO: set category'
+  icon: table
+  params:
+  - name: lastname
+    type: string
+    required: true
+- id: employee_by_firstname
+  title: Employee — By Firstname
+  description: Search Employee by FirstName
+  entity: Employee
+  pattern_id: employee.by_firstname
+  category: '# TODO: set category'
+  icon: table
+  params:
+  - name: firstname
+    type: string
+    required: true
+- id: employee_by_title
+  title: Employee — By Title
+  description: Search Employee by Title
+  entity: Employee
+  pattern_id: employee.by_title
+  category: '# TODO: set category'
+  icon: table
+  params:
+  - name: title
+    type: string
+    required: true
+- id: employee_by_postalcode
+  title: Employee — By Postalcode
+  description: Search Employee by PostalCode
+  entity: Employee
+  pattern_id: employee.by_postalcode
+  category: '# TODO: set category'
+  icon: table
+  params:
+  - name: postalcode
+    type: string
+    required: true
+- id: employee_by_email
+  title: Employee — By Email
+  description: Search Employee by Email
+  entity: Employee
+  pattern_id: employee.by_email
+  category: '# TODO: set category'
+  icon: table
+  params:
+  - name: email
+    type: string
+    required: true
+- id: customer_list_all
+  title: Customer — List All
+  description: List all Customer records
+  entity: Customer
+  pattern_id: customer.list_all
+  category: '# TODO: set category'
+  icon: table
+  params: []
+- id: customer_by_firstname
+  title: Customer — By Firstname
+  description: Search Customer by FirstName
+  entity: Customer
+  pattern_id: customer.by_firstname
+  category: '# TODO: set category'
+  icon: table
+  params:
+  - name: firstname
+    type: string
+    required: true
+- id: customer_by_lastname
+  title: Customer — By Lastname
+  description: Search Customer by LastName
+  entity: Customer
+  pattern_id: customer.by_lastname
+  category: '# TODO: set category'
+  icon: table
+  params:
+  - name: lastname
+    type: string
+    required: true
+- id: customer_by_postalcode
+  title: Customer — By Postalcode
+  description: Search Customer by PostalCode
+  entity: Customer
+  pattern_id: customer.by_postalcode
+  category: '# TODO: set category'
+  icon: table
+  params:
+  - name: postalcode
+    type: string
+    required: true
+- id: customer_by_email
+  title: Customer — By Email
+  description: Search Customer by Email
+  entity: Customer
+  pattern_id: customer.by_email
+  category: '# TODO: set category'
+  icon: table
+  params:
+  - name: email
+    type: string
+    required: true
+- id: invoice_list_all
+  title: Invoice — List All
+  description: List all Invoice records
+  entity: Invoice
+  pattern_id: invoice.list_all
+  category: '# TODO: set category'
+  icon: table
+  params: []
+- id: invoice_by_billingpostalcode
+  title: Invoice — By Billingpostalcode
+  description: Search Invoice by BillingPostalCode
+  entity: Invoice
+  pattern_id: invoice.by_billingpostalcode
+  category: '# TODO: set category'
+  icon: table
+  params:
+  - name: billingpostalcode
+    type: string
+    required: true
+- id: invoiceline_list_all
+  title: Invoiceline — List All
+  description: List all Invoiceline records
+  entity: Invoiceline
+  pattern_id: invoiceline.list_all
+  category: '# TODO: set category'
+  icon: table
+  params: []
+- id: track_list_all
+  title: Track — List All
+  description: List all Track records
+  entity: Track
+  pattern_id: track.list_all
+  category: '# TODO: set category'
+  icon: table
+  params: []
+- id: track_by_name
+  title: Track — By Name
+  description: Search Track by Name
+  entity: Track
+  pattern_id: track.by_name
+  category: '# TODO: set category'
+  icon: table
+  params:
+  - name: name
+    type: string
+    required: true
+- id: playlist_list_all
+  title: Playlist — List All
+  description: List all Playlist records
+  entity: Playlist
+  pattern_id: playlist.list_all
+  category: '# TODO: set category'
+  icon: table
+  params: []
+- id: playlist_by_name
+  title: Playlist — By Name
+  description: Search Playlist by Name
+  entity: Playlist
+  pattern_id: playlist.by_name
+  category: '# TODO: set category'
+  icon: table
+  params:
+  - name: name
+    type: string
+    required: true
+- id: playlisttrack_list_all
+  title: Playlisttrack — List All
+  description: List all Playlisttrack records
+  entity: Playlisttrack
+  pattern_id: playlisttrack.list_all
+  category: '# TODO: set category'
+  icon: table
+  params: []
+- id: genre_list_all
+  title: Genre — List All
+  description: List all Genre records
+  entity: Genre
+  pattern_id: genre.list_all
+  category: '# TODO: set category'
+  icon: table
+  params: []
+- id: genre_by_name
+  title: Genre — By Name
+  description: Search Genre by Name
+  entity: Genre
+  pattern_id: genre.by_name
+  category: '# TODO: set category'
+  icon: table
+  params:
+  - name: name
+    type: string
+    required: true
+- id: mediatype_list_all
+  title: Mediatype — List All
+  description: List all Mediatype records
+  entity: Mediatype
+  pattern_id: mediatype.list_all
+  category: '# TODO: set category'
+  icon: table
+  params: []
+- id: mediatype_by_name
+  title: Mediatype — By Name
+  description: Search Mediatype by Name
+  entity: Mediatype
+  pattern_id: mediatype.by_name
+  category: '# TODO: set category'
+  icon: table
+  params:
+  - name: name
+    type: string
+    required: true
