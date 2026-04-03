@@ -77,6 +77,9 @@ class FieldDef(BaseModel):
     fk: FKReference | None = Field(None, description="FK relationship descriptor")
     max_length: int | None = Field(None, ge=1)
     read_only: bool = Field(False, description="UI disables inline editing for this field")
+    db_column_name: str = Field(
+        "", description="Actual DB column name when it differs from name (e.g. PascalCase)"
+    )
 
     model_config = {"populate_by_name": True}
 
@@ -132,6 +135,9 @@ class EntitySkill(BaseModel):
         description="JWT role names that may mutate this entity; empty = deny all",
     )
     schema_name: str = Field("public", description="PostgreSQL schema name")
+    db_table_name: str = Field(
+        "", description="Actual DB table name when it differs from table (e.g. PascalCase)"
+    )
 
     @field_validator("entity")
     @classmethod

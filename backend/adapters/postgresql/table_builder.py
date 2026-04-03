@@ -32,7 +32,7 @@ class TableBuilder:
         Build (or return cached) sa.Table for the given skill.
         Schema is set from skill.schema_name.
         """
-        cache_key = f"{skill.schema_name}.{skill.table}"
+        cache_key = f"{skill.schema_name}.{skill.db_table_name or skill.table}"
         if cache_key in self._cache:
             return self._cache[cache_key]
 
@@ -44,7 +44,7 @@ class TableBuilder:
                 is_pk=field.isPK,
             )
             col = sa.Column(
-                field.name,
+                field.db_column_name or field.name,
                 col_type,
                 primary_key=field.isPK,
                 nullable=field.nullable if not field.isPK else False,
@@ -52,7 +52,7 @@ class TableBuilder:
             columns.append(col)
 
         table = sa.Table(
-            skill.table,
+            skill.db_table_name or skill.table,
             self._metadata,
             *columns,
             schema=skill.schema_name if skill.schema_name != "public" else None,

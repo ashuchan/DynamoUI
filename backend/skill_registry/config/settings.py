@@ -7,7 +7,7 @@ from __future__ import annotations
 import logging
 from typing import Literal
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -130,8 +130,8 @@ class PatternCacheSettings(BaseSettings):
         ]
     )
     auto_promote_enabled: bool = Field(
-        False,
-        description="Phase 2 stub — must remain false in Phase 1",
+        True,
+        description="Enable write-back of high-confidence LLM patterns to YAML files",
     )
     enforce_skill_hash: bool = Field(
         True, description="Reject patterns with stale skill hashes"
@@ -149,6 +149,39 @@ class PatternCacheSettings(BaseSettings):
         return v
 
 
+class LLMSettings(BaseSettings):
+    """DYNAMO_LLM_* environment variables."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="DYNAMO_LLM_",
+        case_sensitive=False,
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    provider: Literal["anthropic", "google"] = Field("anthropic")
+    anthropic_api_key: SecretStr = Field(default=SecretStr(""))
+    anthropic_model: str = Field("claude-haiku-4-5-20251001")
+    google_api_key: SecretStr = Field(default=SecretStr(""))
+    google_model: str = Field("gemini-1.5-flash")
+    max_tokens: int = Field(8192)
+    timeout_seconds: float = Field(60.0)
+    auto_promote_threshold: float = Field(
+        0.95,
+        description="LLM synthesis confidence >= this → auto-promote to patterns YAML",
+    )
+    review_queue_threshold: float = Field(
+        0.90,
+        description="confidence >= this but < auto_promote → write to review queue",
+    )
+    review_queue_path: str = Field("./pattern_reviews/")
+    auto_promote_enabled: bool = Field(
+        True,
+        description="Enable write-back of high-confidence LLM patterns to YAML files",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Module-level singletons — constructed once at import time.
 # Tests can override by monkey-patching or using dependency injection.
@@ -156,6 +189,7 @@ class PatternCacheSettings(BaseSettings):
 skill_settings = SkillRegistrySettings()
 pg_settings = PostgreSQLSettings()
 cache_settings = PatternCacheSettings()
+llm_settings = LLMSettings()
 
 
 def configure_logging(settings: SkillRegistrySettings = skill_settings) -> None:

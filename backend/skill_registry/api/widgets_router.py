@@ -54,7 +54,7 @@ def list_widgets(request: Request) -> list[dict]:
 
 
 @router.get("/widgets/dashboard", summary="Widgets grouped by category")
-def dashboard_widgets(request: Request) -> dict[str, list[dict]]:
+def dashboard_widgets(request: Request) -> list[dict]:
     widgets = _get_widgets(request)
     items = widgets.get("widgets", []) if isinstance(widgets, dict) else []
 
@@ -63,8 +63,9 @@ def dashboard_widgets(request: Request) -> dict[str, list[dict]]:
         cat = w.get("category", "Uncategorized")
         grouped.setdefault(cat, []).append(w)
 
-    log.debug("api.widgets.dashboard", categories=len(grouped))
-    return grouped
+    result = [{"category": cat, "widgets": ws} for cat, ws in grouped.items()]
+    log.debug("api.widgets.dashboard", categories=len(result))
+    return result
 
 
 @router.get("/widgets/entity/{entity}", summary="Widgets for a specific entity")

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -22,6 +23,17 @@ class ScaffoldOutput(NamedTuple):
     skill_yaml: str
     patterns_yaml: str
     widgets: list[dict]
+
+
+def _pascal_to_snake(name: str) -> str:
+    """Convert PascalCase/camelCase identifier to snake_case. AlbumId → album_id"""
+    s1 = re.sub(r'([A-Z]+)([A-Z][a-z])', r'\1_\2', name)
+    return re.sub(r'([a-z\d])([A-Z])', r'\1_\2', s1).lower()
+
+
+def _snake_to_entity(snake_name: str) -> str:
+    """Convert snake_case to PascalCase entity name. invoice_line → InvoiceLine"""
+    return "".join(word.capitalize() for word in snake_name.split("_"))
 
 
 def _type_hint_for_pg_type(pg_type: str) -> str:
@@ -42,23 +54,49 @@ def _type_hint_for_pg_type(pg_type: str) -> str:
     return "string"
 
 
+def _normalize_pattern(p: dict) -> dict:
+    """
+    Normalise an LLM-generated pattern dict to satisfy PatternFile validation:
+    - query_template must be a JSON string, not a dict
+    - param default values must be str or None, not int/float/bool
+    """
+    import json as _json
+    p = dict(p)
+    if isinstance(p.get("query_template"), dict):
+        p["query_template"] = _json.dumps(p["query_template"])
+    if p.get("params"):
+        normalised_params = []
+        for param in p["params"]:
+            param = dict(param)
+            default = param.get("default")
+            if default is not None and not isinstance(default, str):
+                param["default"] = str(default)
+            normalised_params.append(param)
+        p["params"] = normalised_params
+    return p
+
+
 def _compute_hash(content: str, length: int = 16) -> str:
     """SHA-256 of content string, truncated to length chars (matches PatternHasher)."""
     return hashlib.sha256(content.encode()).hexdigest()[:length]
 
 
-def _build_patterns(entity: str, columns: list[dict[str, Any]]) -> list[dict]:
+def _build_patterns(entity: str, snake_table: str, columns: list[dict[str, Any]]) -> list[dict]:
     """
     Build scaffold pattern dicts from raw PG column descriptors.
     Always produces a 'list_all' pattern; adds per-field search patterns
     for string columns whose names contain common name-like keywords.
+
+    pattern IDs use the snake_case table name as prefix (e.g. invoice_line.list_all).
+    filter fields reference the snake_case field name.
     """
+    pattern_prefix = snake_table  # snake_case for pattern IDs
     entity_lower = entity.lower()
-    entity_plural = f"{entity_lower}s"
+    entity_plural = f"{snake_table}s"  # simple plural of snake_case name
 
     patterns: list[dict] = [
         {
-            "id": f"{entity_lower}.list_all",
+            "id": f"{pattern_prefix}.list_all",
             "description": f"List all {entity} records",
             "triggers": [
                 f"all {entity_plural}",
@@ -78,31 +116,35 @@ def _build_patterns(entity: str, columns: list[dict[str, Any]]) -> list[dict]:
         if _type_hint_for_pg_type(col["type"]) != "string":
             continue
         col_name = col["name"]
-        col_lower = col_name.lower()
-        if not any(kw in col_lower for kw in name_keywords):
+        snake_col = _pascal_to_snake(col_name)
+        if not any(kw in snake_col for kw in name_keywords):
             continue
         patterns.append({
-            "id": f"{entity_lower}.by_{col_lower}",
-            "description": f"Search {entity} by {col_name}",
+            "id": f"{pattern_prefix}.by_{snake_col}",
+            "description": f"Search {entity} by {snake_col.replace('_', ' ').title()}",
             "triggers": [
-                f"{entity_lower} {col_lower}",
-                f"find {entity_lower} by {col_lower}",
-                f"search {entity_lower} {col_lower}",
+                f"{entity_lower} {snake_col.replace('_', ' ')}",
+                f"find {entity_lower} by {snake_col.replace('_', ' ')}",
+                f"search {entity_lower} {snake_col.replace('_', ' ')}",
             ],
             "query_template": json.dumps({
-                "filters": [{"field": col_name, "op": "ilike", "value": f"{{{col_lower}}}"}]
+                "filters": [{"field": snake_col, "op": "like", "value": f"{{{snake_col}}}"}]
             }),
-            "params": [{"name": col_lower, "type": "string", "required": True}],
+            "params": [{"name": snake_col, "type": "string", "required": True}],
         })
 
     return patterns
 
 
-def scaffold_from_columns(
+async def scaffold_from_columns(
     table: str,
     schema: str,
     adapter_key: str,
     columns: list[dict[str, Any]],
+    output_dir: Path | None = None,
+    *,
+    llm_seeder: "PatternSeeder | None" = None,
+    full_schema_context: str = "",
 ) -> ScaffoldOutput:
     """
     Build a ScaffoldOutput (skill YAML, patterns YAML, widget entries)
@@ -114,28 +156,41 @@ def scaffold_from_columns(
       - nullable: bool
       - is_pk: bool
     """
-    entity = "".join(word.capitalize() for word in table.split("_"))
+    # Derive snake_case table name and PascalCase entity name
+    snake_table = _pascal_to_snake(table) if not re.match(r'^[a-z][a-z0-9_]*$', table) else table
+    entity = _snake_to_entity(snake_table)
+    # Store the original DB table name if it differs from snake_case
+    db_table_name = table if table != snake_table else ""
 
     # ── skill YAML ────────────────────────────────────────────────────────────
     fields: list[dict] = []
     for col in columns:
+        col_name = col["name"]
+        snake_col = _pascal_to_snake(col_name) if not re.match(r'^[a-z][a-z0-9_]*$', col_name) else col_name
         field_type = _type_hint_for_pg_type(col["type"])
         field_def: dict = {
-            "name": col["name"],
+            "name": snake_col,
             "type": field_type,
             "nullable": col.get("nullable", True),
             "isPK": col.get("is_pk", False),
         }
         if col.get("is_pk"):
             field_def["nullable"] = False
+        if col_name != snake_col:
+            field_def["db_column_name"] = col_name
         if field_type == "enum":
             field_def["enumRef"] = "# TODO: set enum name"
         fields.append(field_def)
 
-    patterns_filename = f"{table}.patterns.yaml"
+    patterns_filename = f"{snake_table}.patterns.yaml"
+    if output_dir is not None:
+        patterns_file_path = str(output_dir / patterns_filename)
+    else:
+        patterns_file_path = patterns_filename
+
     skill_data: dict = {
         "entity": entity,
-        "table": table,
+        "table": snake_table,
         "adapter": adapter_key,
         "description": f"# TODO: describe {entity}",
         "schema_name": schema,
@@ -148,11 +203,14 @@ def scaffold_from_columns(
             "searchable_fields": [],
             "page_size": 25,
         },
-        "mutations_file": "# TODO: set path or leave empty for read-only",
-        "patterns_file": patterns_filename,
+        "mutations_file": "",
+        "patterns_file": patterns_file_path,
         "read_permissions": [],
         "write_permissions": [],
     }
+
+    if db_table_name:
+        skill_data["db_table_name"] = db_table_name
 
     skill_yaml = SCAFFOLD_HEADER + yaml.dump(
         skill_data, default_flow_style=False, sort_keys=False, allow_unicode=True
@@ -160,7 +218,23 @@ def scaffold_from_columns(
 
     # ── patterns YAML ─────────────────────────────────────────────────────────
     skill_hash = _compute_hash(skill_yaml)
-    patterns = _build_patterns(entity, columns)
+    patterns = _build_patterns(entity, snake_table, columns)
+
+    if llm_seeder is not None:
+        # Build a minimal context from just this entity when no full schema was provided
+        ctx = full_schema_context or llm_seeder.build_full_schema_context(
+            {entity: skill_yaml}, {}
+        )
+        llm_patterns = await llm_seeder.seed_patterns(entity, skill_yaml, ctx)
+        if llm_patterns:
+            existing_ids = {p["id"] for p in patterns}
+            for lp in llm_patterns:
+                if lp.get("id") and lp["id"] not in existing_ids:
+                    patterns.append(_normalize_pattern(lp))
+                    existing_ids.add(lp["id"])
+            log.info("scaffolder.llm_patterns_merged",
+                     entity=entity, count=len(llm_patterns))
+
     patterns_data = {"entity": entity, "patterns": patterns}
     patterns_yaml = (
         f"# skill_hash: {skill_hash}\n"
@@ -169,13 +243,12 @@ def scaffold_from_columns(
     )
 
     # ── widget entries ────────────────────────────────────────────────────────
-    entity_lower = entity.lower()
     widgets: list[dict] = []
     for pattern in patterns:
         pattern_id = pattern["id"]
         pattern_name = pattern_id.split(".")[-1]
         widgets.append({
-            "id": f"{entity_lower}_{pattern_name}",
+            "id": f"{snake_table}_{pattern_name}",
             "title": f"{entity} — {pattern_name.replace('_', ' ').title()}",
             "description": pattern.get("description", ""),
             "entity": entity,
@@ -188,7 +261,8 @@ def scaffold_from_columns(
     log.info(
         "scaffolder.generated",
         entity=entity,
-        table=table,
+        table=snake_table,
+        db_table_name=db_table_name or snake_table,
         fields=len(fields),
         patterns=len(patterns),
         widgets=len(widgets),
@@ -196,10 +270,73 @@ def scaffold_from_columns(
     return ScaffoldOutput(skill_yaml=skill_yaml, patterns_yaml=patterns_yaml, widgets=widgets)
 
 
+def _merge_llm_patterns(
+    output: ScaffoldOutput,
+    entity: str,
+    llm_patterns: list[dict],
+) -> tuple[ScaffoldOutput, list[dict]]:
+    """
+    Merge LLM-generated patterns into an existing ScaffoldOutput.
+    Returns the updated ScaffoldOutput and the list of newly added widgets.
+    """
+    # Parse the existing patterns_yaml, skipping header lines
+    lines = output.patterns_yaml.split("\n")
+    skip = sum(
+        1 for line in lines[:2]
+        if line.startswith("# skill_hash:") or line.startswith("# Auto-generated")
+    )
+    header = "\n".join(lines[:skip])
+    body = "\n".join(lines[skip:])
+    raw = yaml.safe_load(body) or {}
+    raw.setdefault("patterns", [])
+
+    existing_ids = {p["id"] for p in raw["patterns"]}
+    added: list[dict] = []
+    for lp in llm_patterns:
+        if lp.get("id") and lp["id"] not in existing_ids:
+            lp = _normalize_pattern(lp)
+            raw["patterns"].append(lp)
+            existing_ids.add(lp["id"])
+            added.append(lp)
+
+    if not added:
+        return output, []
+
+    new_patterns_yaml = (
+        (header + "\n" if header else "")
+        + yaml.dump(raw, default_flow_style=False, sort_keys=False, allow_unicode=True)
+    )
+    entity_lower = entity.lower()
+    new_widgets = []
+    for lp in added:
+        pattern_name = lp["id"].split(".")[-1]
+        new_widgets.append({
+            "id": f"{entity_lower}_{pattern_name}",
+            "title": f"{entity} — {pattern_name.replace('_', ' ').title()}",
+            "description": lp.get("description", ""),
+            "entity": entity,
+            "pattern_id": lp["id"],
+            "category": "# TODO: set category",
+            "icon": "table",
+            "params": lp.get("params", []),
+        })
+
+    updated = ScaffoldOutput(
+        skill_yaml=output.skill_yaml,
+        patterns_yaml=new_patterns_yaml,
+        widgets=list(output.widgets) + new_widgets,
+    )
+    return updated, new_widgets
+
+
 async def scaffold_table(
     adapter_key: str,
     table_name: str,
     schema_name: str = "public",
+    output_dir: Path | None = None,
+    *,
+    llm_seeder: "PatternSeeder | None" = None,
+    full_schema_context: str = "",
 ) -> ScaffoldOutput:
     """
     Inspect a live PostgreSQL table and return a ScaffoldOutput.
@@ -209,18 +346,33 @@ async def scaffold_table(
 
     inspector = SchemaInspector(adapter_key)
     columns = await inspector.inspect_table(table_name, schema_name)
-    return scaffold_from_columns(table_name, schema_name, adapter_key, columns)
+    return await scaffold_from_columns(
+        table_name, schema_name, adapter_key, columns,
+        output_dir,
+        llm_seeder=llm_seeder, full_schema_context=full_schema_context,
+    )
 
 
 async def scaffold_schema(
     adapter_key: str,
     schema_name: str = "public",
     output_dir: Path | None = None,
+    *,
+    llm_seeder: "PatternSeeder | None" = None,
+    llm_batch_size: int = 5,
 ) -> dict[str, ScaffoldOutput]:
     """
     Inspect all tables in a PostgreSQL schema and return {table_name: ScaffoldOutput}.
     If output_dir is provided, writes *.skill.yaml, *.patterns.yaml, and widgets.yaml to disk.
+
+    When llm_seeder is provided:
+    - Single DB pass to scaffold all tables with heuristic patterns.
+    - Batch LLM calls (llm_batch_size entities per call) to generate cross-entity patterns.
+    - LLM-generated patterns are merged into the heuristic results in-memory.
+    This produces ceil(N/llm_batch_size) LLM calls instead of N calls.
     """
+    import re as _re
+    import yaml as _yaml_mod
     from backend.adapters.postgresql.schema_inspector import SchemaInspector
 
     inspector = SchemaInspector(adapter_key)
@@ -228,18 +380,77 @@ async def scaffold_schema(
     results: dict[str, ScaffoldOutput] = {}
     all_widgets: list[dict] = []
 
+    # Single DB pass — heuristic scaffold for all tables
     for table in tables:
-        output = await scaffold_table(adapter_key, table, schema_name)
+        output = await scaffold_table(adapter_key, table, schema_name, output_dir)
         results[table] = output
         all_widgets.extend(output.widgets)
 
-        if output_dir is not None:
-            skill_path = output_dir / f"{table}.skill.yaml"
-            skill_path.write_text(output.skill_yaml, encoding="utf-8")
-            log.info("scaffolder.skill_written", path=str(skill_path))
+    if llm_seeder is not None:
+        # Build entity map and full schema context from heuristic results
+        table_to_entity: dict[str, str] = {}
+        all_skill_yamls: dict[str, str] = {}
+        for table, out in results.items():
+            snake = _pascal_to_snake(table) if not _re.match(r'^[a-z][a-z0-9_]*$', table) else table
+            entity = _snake_to_entity(snake)
+            table_to_entity[table] = entity
+            all_skill_yamls[entity] = out.skill_yaml
 
-            patterns_path = output_dir / f"{table}.patterns.yaml"
-            patterns_path.write_text(output.patterns_yaml, encoding="utf-8")
+        fk_edges: dict[str, list] = {}
+        for entity_name, skill_yaml_str in all_skill_yamls.items():
+            raw = _yaml_mod.safe_load(skill_yaml_str) or {}
+            edges = []
+            for f in raw.get("fields", []):
+                fk = f.get("fk")
+                if fk:
+                    edges.append((f["name"], fk.get("entity", ""), fk.get("field", "")))
+            fk_edges[entity_name] = edges
+
+        full_schema_context = llm_seeder.build_full_schema_context(all_skill_yamls, fk_edges)
+
+        # Batch LLM calls — ceil(N / llm_batch_size) total calls
+        table_list = list(tables)
+        for i in range(0, len(table_list), llm_batch_size):
+            batch_tables = table_list[i:i + llm_batch_size]
+            batch_skill_yamls = {
+                table_to_entity[t]: all_skill_yamls[table_to_entity[t]]
+                for t in batch_tables
+            }
+            batch_patterns = await llm_seeder.seed_patterns_batch(
+                batch_skill_yamls, full_schema_context
+            )
+            log.info(
+                "scaffolder.llm_batch_complete",
+                batch=i // llm_batch_size + 1,
+                entities=list(batch_skill_yamls.keys()),
+                returned_entities=list(batch_patterns.keys()),
+            )
+
+            # Merge LLM patterns into results for each table in this batch
+            for table in batch_tables:
+                entity = table_to_entity[table]
+                llm_pats = batch_patterns.get(entity, [])
+                if not llm_pats:
+                    continue
+                results[table], new_widgets = _merge_llm_patterns(
+                    results[table], entity, llm_pats
+                )
+                # Replace widgets for this table in all_widgets
+                all_widgets = [w for w in all_widgets if w.get("entity") != entity]
+                all_widgets.extend(results[table].widgets)
+                log.info("scaffolder.llm_patterns_merged",
+                         entity=entity, count=len(llm_pats))
+
+    # Write all skill + patterns files
+    if output_dir is not None:
+        import re as _re
+        for table, out in results.items():
+            snake_table = _pascal_to_snake(table) if not _re.match(r'^[a-z][a-z0-9_]*$', table) else table
+            skill_path = output_dir / f"{snake_table}.skill.yaml"
+            skill_path.write_text(out.skill_yaml, encoding="utf-8")
+            log.info("scaffolder.skill_written", path=str(skill_path))
+            patterns_path = output_dir / f"{snake_table}.patterns.yaml"
+            patterns_path.write_text(out.patterns_yaml, encoding="utf-8")
             log.info("scaffolder.patterns_written", path=str(patterns_path))
 
     if output_dir is not None and all_widgets:

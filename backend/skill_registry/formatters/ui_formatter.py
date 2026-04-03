@@ -94,12 +94,14 @@ def format_display_config(skill: EntitySkill) -> dict:
     dc = skill.display
     return {
         "entity": skill.entity,
-        "defaultSortField": dc.default_sort_field,
-        "defaultSortDir": dc.default_sort_dir,
-        "columnsVisible": dc.columns_visible,
+        "defaultSort": {
+            "field": dc.default_sort_field,
+            "direction": dc.default_sort_dir,
+        },
+        "defaultPageSize": dc.page_size,
+        "visibleFields": dc.columns_visible,
         "detailFields": dc.detail_fields,
         "searchableFields": dc.searchable_fields,
-        "pageSize": dc.page_size,
     }
 
 

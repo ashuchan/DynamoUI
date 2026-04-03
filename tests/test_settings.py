@@ -106,17 +106,15 @@ class TestPatternCacheSettings:
         from backend.skill_registry.config.settings import PatternCacheSettings
         s = PatternCacheSettings()
         assert s.fuzzy_threshold == 0.90
-        assert s.auto_promote_enabled is False  # must remain false in Phase 1
+        assert s.auto_promote_enabled is True  # enabled now that Phase 2 promotion is implemented
         assert s.enforce_skill_hash is True
         assert s.hash_length == 16
 
-    def test_auto_promote_must_be_false_in_phase1(self):
-        """Guard: auto_promote_enabled must default to false in Phase 1."""
+    def test_auto_promote_enabled_by_default(self):
+        """Phase 2 promotion is now implemented — auto_promote_enabled defaults to True."""
         from backend.skill_registry.config.settings import PatternCacheSettings
         s = PatternCacheSettings()
-        assert s.auto_promote_enabled is False, (
-            "DYNAMO_CACHE_AUTO_PROMOTE_ENABLED must default to false in Phase 1"
-        )
+        assert s.auto_promote_enabled is True
 
     def test_fuzzy_threshold_out_of_range_raises(self):
         from backend.skill_registry.config.settings import PatternCacheSettings

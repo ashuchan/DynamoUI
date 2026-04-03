@@ -167,7 +167,7 @@ async def _startup(app: FastAPI) -> None:
 
     # Step 6 — Initialise adapters
     from backend.adapters.registry import initialise_adapters
-    await initialise_adapters(str(adapters_registry_path), pg_settings)
+    await initialise_adapters(str(adapters_registry_path), pg_settings, skill_registry=registry)
 
     # Step 7 — Build pattern cache
     from backend.pattern_cache.cache.pattern_cache import PatternCache
@@ -182,6 +182,43 @@ async def _startup(app: FastAPI) -> None:
         [pf for _, pf in discovery.patterns]
     )
     app.state.pattern_cache = pattern_cache
+
+    # Step 8 — Wire LLM provider, QuerySynthesiser, PatternPromoter
+    from backend.skill_registry.config.settings import llm_settings
+    from backend.skill_registry.llm.provider import create_provider
+    from backend.skill_registry.llm.query_synthesiser import QuerySynthesiser
+    from backend.pattern_cache.promotion.promoter import PatternPromoter
+
+    llm_provider = create_provider(llm_settings)
+    app.state.query_synthesiser = QuerySynthesiser(llm_provider)
+
+    def _on_pattern_promoted(entity: str, path: Path) -> None:
+        from backend.skill_registry.loader.yaml_loader import load_patterns
+        from backend.pattern_cache.loader.pattern_loader import PatternLoader
+        try:
+            pf = load_patterns(path)
+            loader = PatternLoader(enforce_skill_hash=False)
+            entries = loader.build_trigger_entries(
+                [pf], app.state.pattern_cache._stopwords
+            )
+            existing = app.state.pattern_cache._index.all_entries()
+            merged = [e for e in existing if e.entity != entity] + entries
+            app.state.pattern_cache._index.build(merged)
+            app.state.pattern_cache._pattern_by_id.update(
+                {p.id: pf for p in pf.patterns}
+            )
+            log.info("pattern_cache.hot_reloaded", entity=entity, new_entries=len(entries))
+        except Exception as exc:
+            log.warning("pattern_cache.hot_reload_failed", entity=entity, error=str(exc))
+
+    app.state.pattern_promoter = PatternPromoter(
+        skills_dir=skills_dir,
+        auto_promote_enabled=llm_settings.auto_promote_enabled,
+        auto_promote_threshold=llm_settings.auto_promote_threshold,
+        review_queue_threshold=llm_settings.review_queue_threshold,
+        review_queue_path=Path(llm_settings.review_queue_path),
+        on_promote_callback=_on_pattern_promoted,
+    )
 
     boot_time_ms = (time.monotonic() - t0) * 1000
     registry.boot_time_ms = boot_time_ms

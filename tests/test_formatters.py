@@ -76,8 +76,8 @@ class TestUIFormatter:
 
         config = format_display_config(employee_skill)
         assert config["entity"] == "Employee"
-        assert "columnsVisible" in config
-        assert config["pageSize"] == 25
+        assert "visibleFields" in config
+        assert config["defaultPageSize"] == 25
 
 
 class TestEnumRegistry:

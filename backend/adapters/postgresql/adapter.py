@@ -30,14 +30,16 @@ class PostgreSQLAdapter(DataAdapter):
         self,
         adapter_key: str = "postgresql",
         settings: object | None = None,
+        skill_registry: object | None = None,
     ) -> None:
         from backend.skill_registry.config.settings import pg_settings
 
         self._adapter_key = adapter_key
         self._settings = settings or pg_settings
+        self._skill_registry = skill_registry
         self._engine = PostgreSQLEngine(self._settings)
         self._table_builder = TableBuilder()
-        self._translator = QueryTranslator(self._table_builder)
+        self._translator = QueryTranslator(self._table_builder, self._skill_registry)
         self._diff_builder = DiffBuilder()
         self._executor: MutationExecutor | None = None
         self._validator: SchemaValidator | None = None
@@ -82,7 +84,11 @@ class PostgreSQLAdapter(DataAdapter):
             total_count = count_result.scalar() or 0
 
             data_result = await conn.execute(stmt)
-            rows = [dict(row._mapping) for row in data_result.fetchall()]
+            field_map = self._db_to_logical(skill)
+            rows = [
+                self._remap_row(dict(row._mapping), field_map)
+                for row in data_result.fetchall()
+            ]
 
         log.debug(
             "postgresql_adapter.query_executed",
@@ -107,8 +113,8 @@ class PostgreSQLAdapter(DataAdapter):
         import sqlalchemy as sa
 
         table = self._table_builder.build(skill)
-        pk_field = skill.pk_field.name
-        stmt = sa.select(table).where(table.c[pk_field] == pk_value)
+        pk_col_name = skill.pk_field.db_column_name or skill.pk_field.name
+        stmt = sa.select(table).where(table.c[pk_col_name] == pk_value)
 
         async with self._engine.read_engine.connect() as conn:
             result = await conn.execute(stmt)
@@ -122,13 +128,24 @@ class PostgreSQLAdapter(DataAdapter):
             )
             return None
 
-        record = dict(row._mapping)
+        field_map = self._db_to_logical(skill)
+        record = self._remap_row(dict(row._mapping), field_map)
         log.debug(
             "postgresql_adapter.single_fetched",
             entity=skill.entity,
             pk=pk_value,
         )
         return record
+
+    @staticmethod
+    def _db_to_logical(skill: EntitySkill) -> dict[str, str]:
+        """Build a map from db_column_name → logical field.name."""
+        return {(f.db_column_name or f.name): f.name for f in skill.fields}
+
+    @staticmethod
+    def _remap_row(row: dict[str, Any], field_map: dict[str, str]) -> dict[str, Any]:
+        """Re-key a row dict from db column names to logical field names."""
+        return {field_map.get(k, k): v for k, v in row.items()}
 
     async def preview_mutation(
         self,

@@ -173,8 +173,8 @@ class TestSchemaEndpoints:
         assert resp.status_code == 200
         data = resp.json()
         assert data["entity"] == "Employee"
-        assert "columnsVisible" in data
-        assert data["pageSize"] == 25
+        assert "visibleFields" in data
+        assert data["defaultPageSize"] == 25
 
     def test_entity_mutations_empty(self, test_client):
         # Employee has no mutations_file — should return empty list
@@ -330,8 +330,9 @@ class TestWidgetEndpoints:
         resp = test_client.get("/api/v1/widgets/dashboard")
         assert resp.status_code == 200
         data = resp.json()
-        assert "HR" in data
-        assert len(data["HR"]) >= 1
+        hr_group = next((g for g in data if g["category"] == "HR"), None)
+        assert hr_group is not None
+        assert len(hr_group["widgets"]) >= 1
 
     def test_widgets_for_entity(self, test_client):
         resp = test_client.get("/api/v1/widgets/entity/Employee")

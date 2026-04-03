@@ -1,0 +1,2 @@
+[console_scripts]
+dynamoui = backend.skill_registry.cli.validate:cli

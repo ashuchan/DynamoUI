@@ -170,6 +170,19 @@ def validate_command(
 @click.option("--output", "output_path", default=None, help="Output file path")
 @click.option("--output-dir", default=None, help="Output directory for multi-table scaffold")
 @click.option("--dry-run", is_flag=True, default=False, help="Print YAML without writing to disk")
+@click.option(
+    "--seed-patterns",
+    is_flag=True,
+    default=False,
+    help="Use LLM to seed cross-entity patterns (requires DYNAMO_LLM_* env vars)",
+)
+@click.option(
+    "--llm-batch-size",
+    default=5,
+    show_default=True,
+    type=int,
+    help="Number of entities per LLM call when --seed-patterns is active",
+)
 def scaffold_command(
     adapter: str,
     table: Optional[str],
@@ -177,6 +190,8 @@ def scaffold_command(
     output_path: Optional[str],
     output_dir: Optional[str],
     dry_run: bool,
+    seed_patterns: bool,
+    llm_batch_size: int,
 ) -> None:
     """Generate skill YAML from a live PostgreSQL table or schema."""
     from backend.adapters.registry import initialise_adapters
@@ -186,8 +201,18 @@ def scaffold_command(
     async def _run() -> None:
         await initialise_adapters(skill_settings.adapters_registry, pg_settings)
 
+        seeder = None
+        if seed_patterns:
+            from backend.skill_registry.config.settings import llm_settings
+            from backend.skill_registry.llm.provider import create_provider
+            from backend.skill_registry.llm.pattern_seeder import PatternSeeder
+            provider = create_provider(llm_settings)
+            seeder = PatternSeeder(provider)
+            click.echo("LLM pattern seeding enabled.")
+
         if table:
-            output = await scaffold_table(adapter, table, schema)
+            _single_out_dir = Path(output_path).parent if output_path else None
+            output = await scaffold_table(adapter, table, schema, _single_out_dir, llm_seeder=seeder)
             if dry_run or not output_path:
                 click.echo(output.skill_yaml)
                 click.echo(f"--- {table}.patterns.yaml ---")
@@ -211,7 +236,7 @@ def scaffold_command(
         elif output_dir:
             out_dir = Path(output_dir)
             out_dir.mkdir(parents=True, exist_ok=True)
-            results = await scaffold_schema(adapter, schema, out_dir if not dry_run else None)
+            results = await scaffold_schema(adapter, schema, out_dir if not dry_run else None, llm_seeder=seeder, llm_batch_size=llm_batch_size)
             if dry_run:
                 for tbl, output in results.items():
                     click.echo(f"--- {tbl}.skill.yaml ---")

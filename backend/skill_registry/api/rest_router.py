@@ -6,7 +6,7 @@ All routes are prefixed with /api/v1 by the main app.
 from __future__ import annotations
 
 import hashlib
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -136,6 +136,72 @@ def entity_mutations(entity: str, registry: RegistryDep) -> list[dict]:
 # Resolve endpoint (NL input → intent classification)
 # ---------------------------------------------------------------------------
 
+# Synonyms for entity names that users commonly use in natural language.
+# Maps lowercase synonym → registered entity name.
+_ENTITY_SYNONYMS: dict[str, str] = {
+    "song": "Track",
+    "songs": "Track",
+    "track": "Track",
+    "tracks": "Track",
+    "purchase": "Invoice",
+    "purchases": "Invoice",
+    "order": "Invoice",
+    "orders": "Invoice",
+    "sale": "Invoice",
+    "sales": "Invoice",
+    "invoice": "Invoice",
+    "invoices": "Invoice",
+    "line": "InvoiceLine",
+    "lines": "InvoiceLine",
+    "album": "Album",
+    "albums": "Album",
+    "artist": "Artist",
+    "artists": "Artist",
+    "customer": "Customer",
+    "customers": "Customer",
+    "employee": "Employee",
+    "employees": "Employee",
+    "genre": "Genre",
+    "genres": "Genre",
+    "media": "MediaType",
+    "mediatype": "MediaType",
+    "mediatypes": "MediaType",
+    "playlist": "Playlist",
+    "playlists": "Playlist",
+}
+
+
+def _extract_entity(query: str, known_entities: list[str]) -> str | None:
+    """
+    Scan the query for entity name keywords and return the entity whose
+    keyword appears earliest.  Falls back to checking registered entity
+    names directly (singular + plural) in case the synonym map is incomplete.
+    """
+    q_lower = query.lower()
+    words = q_lower.split()
+
+    best_pos: int = len(q_lower) + 1
+    best_entity: str | None = None
+
+    # Check synonym map
+    for word in words:
+        entity = _ENTITY_SYNONYMS.get(word)
+        if entity and entity in known_entities:
+            pos = q_lower.index(word)
+            if pos < best_pos:
+                best_pos = pos
+                best_entity = entity
+
+    # Check registered entity names directly (handles any entity not in map)
+    for entity in known_entities:
+        for candidate in (entity.lower(), entity.lower() + "s"):
+            idx = q_lower.find(candidate)
+            if idx != -1 and idx < best_pos:
+                best_pos = idx
+                best_entity = entity
+
+    return best_entity
+
 
 class ResolveRequest(BaseModel):
     input: str
@@ -148,6 +214,7 @@ class ResolveResponse(BaseModel):
     confidence: float | None = None
     query_plan: dict | None = None
     did_you_mean: str | None = None
+    source: Literal["pattern_cache", "llm_synthesis", "none"] = "none"
 
 
 @router.post("/resolve", summary="Classify NL input + return QueryPlan")
@@ -174,10 +241,67 @@ async def resolve_input(body: ResolveRequest, request: Request) -> ResolveRespon
         return ResolveResponse(intent="READ")
 
     result = pattern_cache.lookup(raw_input)
-    if result is None:
+    if result is None or result.tier == "cache_miss":
         log.info("api.resolve.cache_miss", input_hash=input_hash)
-        # Phase 2: LLM fallback goes here
-        return ResolveResponse(intent="READ", confidence=0.0)
+        # Entity-name extraction fallback: navigate to the entity the user
+        # mentioned even if we can't parse the full query semantics.
+        registry: SkillRegistry = request.app.state.skill_registry
+        known = list(registry.entity_by_name.keys())
+        entity = _extract_entity(raw_input, known)
+        if entity:
+            log.info("api.resolve.entity_extracted", entity=entity, input_hash=input_hash)
+            return ResolveResponse(intent="READ", entity=entity, confidence=0.5)
+
+        # --- LLM synthesis fallback ---
+        from backend.skill_registry.llm.query_synthesiser import QuerySynthesiser
+        from backend.skill_registry.config.settings import llm_settings
+
+        synthesiser: QuerySynthesiser = getattr(request.app.state, "query_synthesiser", None)
+        if synthesiser is None:
+            return ResolveResponse(intent="READ", confidence=0.0, source="none")
+
+        query_plan_and_confidence = await synthesiser.synthesise(raw_input, registry)
+        if query_plan_and_confidence is None:
+            return ResolveResponse(intent="READ", confidence=0.0, source="none")
+        query_plan, synthesis_confidence = query_plan_and_confidence
+
+        skill = registry.entity_by_name.get(query_plan.entity)
+        if skill is None:
+            return ResolveResponse(intent="READ", confidence=0.0, source="none")
+
+        from backend.adapters.registry import get_adapter_registry
+        adapter_reg = get_adapter_registry()
+        adapter = adapter_reg.get(skill.adapter)
+        if adapter is None:
+            return ResolveResponse(intent="READ", confidence=0.0, source="none")
+
+        try:
+            result = await adapter.execute_query(skill, query_plan)
+        except Exception as exc:
+            log.warning("api.resolve.execute_failed", error=str(exc), input_hash=input_hash)
+            return ResolveResponse(intent="READ", confidence=0.0, source="none")
+
+        # Async promotion — fire and forget, never blocks response
+        promoter = getattr(request.app.state, "pattern_promoter", None)
+        if promoter is not None:
+            import asyncio
+            asyncio.create_task(
+                promoter.promote(
+                    user_input=raw_input,
+                    query_plan=query_plan,
+                    confidence=synthesis_confidence,
+                    entity=query_plan.entity,
+                )
+            )
+
+        log.info("api.resolve.llm_synthesis", input_hash=input_hash, entity=query_plan.entity)
+        return ResolveResponse(
+            intent="READ",
+            entity=query_plan.entity,
+            confidence=synthesis_confidence,
+            query_plan={"rows": result.rows, "total_count": result.total_count},
+            source="llm_synthesis",
+        )
 
     log.info(
         "api.resolve.cache_hit",
@@ -192,6 +316,7 @@ async def resolve_input(body: ResolveRequest, request: Request) -> ResolveRespon
             entity=result.entity,
             pattern_id=result.pattern_id,
             confidence=result.confidence,
+            source="pattern_cache",
         )
     elif result.confidence >= 0.80:
         return ResolveResponse(
@@ -200,6 +325,7 @@ async def resolve_input(body: ResolveRequest, request: Request) -> ResolveRespon
             pattern_id=result.pattern_id,
             confidence=result.confidence,
             did_you_mean=result.matched_trigger,
+            source="pattern_cache",
         )
     else:
         # < 0.80 — cache miss, LLM fallback (Phase 2 stub)

@@ -32,6 +32,25 @@ class SortClause:
 
 
 @dataclass
+class JoinClause:
+    """A join to another entity table."""
+
+    source_field: str          # field name on the primary entity table
+    target_entity: str         # PascalCase entity name in SkillRegistry
+    target_field: str          # field name on the target table
+    join_type: Literal["inner", "left"] = "inner"
+
+
+@dataclass
+class AggregationClause:
+    """An aggregation expression."""
+
+    func: Literal["count", "sum", "avg", "min", "max"]
+    field: str                 # field name, or "*" for count(*)
+    alias: str                 # result column alias
+
+
+@dataclass
 class QueryPlan:
     """
     Describes a read operation against an entity.
@@ -44,6 +63,10 @@ class QueryPlan:
     page: int = 1
     page_size: int = 25
     select_fields: list[str] = field(default_factory=list)
+    joins: list[JoinClause] = field(default_factory=list)
+    aggregations: list[AggregationClause] = field(default_factory=list)
+    group_by: list[str] = field(default_factory=list)
+    result_limit: int | None = None   # TOP N — mutually exclusive with pagination
 
 
 @dataclass

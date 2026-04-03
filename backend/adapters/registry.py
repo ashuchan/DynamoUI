@@ -46,6 +46,7 @@ class _AdapterRegistryProxy:
 async def initialise_adapters(
     adapter_registry_yaml_path: str,
     pg_settings: object | None = None,
+    skill_registry: object | None = None,
 ) -> None:
     """
     Instantiate and register all adapters described in adapters.registry.yaml.
@@ -66,7 +67,7 @@ async def initialise_adapters(
         if entry.type == "postgresql":
             from backend.adapters.postgresql.adapter import PostgreSQLAdapter
 
-            adapter = PostgreSQLAdapter(adapter_key=entry.key, settings=pg_settings)
+            adapter = PostgreSQLAdapter(adapter_key=entry.key, settings=pg_settings, skill_registry=skill_registry)
             await adapter.initialise()
             register_adapter(adapter)
         else:
