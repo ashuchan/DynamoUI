@@ -136,6 +136,74 @@ def _build_patterns(entity: str, snake_table: str, columns: list[dict[str, Any]]
     return patterns
 
 
+def _build_role_context_section(entity: str, role_context: list[dict]) -> str:
+    """
+    Build the 'Business use cases' prompt section from scoped role/query pairs.
+
+    role_context: list of {role: str, queries: list[str]} already filtered to this entity.
+    Returns empty string if role_context is empty.
+    """
+    if not role_context:
+        return ""
+    lines = ["\nBusiness use cases:"]
+    for entry in role_context:
+        lines.append(f"{entry['role']} asks:")
+        for q in entry["queries"]:
+            lines.append(f'  - "{q}"')
+    lines.append(
+        "\nGenerate patterns that address these use cases directly. "
+        "Each query above should map to at least one pattern with that query "
+        "(or a close paraphrase) as a trigger."
+    )
+    return "\n".join(lines)
+
+
+def _widget_for_pattern(
+    snake_table: str,
+    entity: str,
+    pattern: dict,
+    role_context: list[dict],
+) -> dict:
+    """
+    Build a widget dict for a pattern.
+    If the pattern trigger matches a role query, use the role name as category
+    and the original query string as title.
+    Falls back to entity name + description-derived title.
+    """
+    pattern_id = pattern["id"]
+    pattern_name = pattern_id.split(".")[-1]
+    triggers = set(t.lower().strip() for t in pattern.get("triggers", []))
+
+    matched_role: str | None = None
+    matched_query: str | None = None
+    for entry in role_context:
+        for q in entry["queries"]:
+            if q.lower().strip() in triggers:
+                matched_role = entry["role"]
+                matched_query = q
+                break
+        if matched_role:
+            break
+
+    if matched_role and matched_query:
+        category = matched_role
+        title = matched_query
+    else:
+        category = entity
+        title = pattern.get("description") or pattern_name.replace("_", " ").title()
+
+    return {
+        "id": f"{snake_table}_{pattern_name}",
+        "title": title,
+        "description": pattern.get("description", ""),
+        "entity": entity,
+        "pattern_id": pattern_id,
+        "category": category,
+        "icon": "table",
+        "params": pattern.get("params", []),
+    }
+
+
 async def scaffold_from_columns(
     table: str,
     schema: str,
@@ -143,8 +211,10 @@ async def scaffold_from_columns(
     columns: list[dict[str, Any]],
     output_dir: Path | None = None,
     *,
+    table_comment: str = "",
     llm_seeder: "PatternSeeder | None" = None,
     full_schema_context: str = "",
+    role_context: list[dict] | None = None,
 ) -> ScaffoldOutput:
     """
     Build a ScaffoldOutput (skill YAML, patterns YAML, widget entries)
@@ -155,7 +225,15 @@ async def scaffold_from_columns(
       - type: str (PostgreSQL type)
       - nullable: bool
       - is_pk: bool
+    Optional per-column fields (from SchemaInspector):
+      - comment: str — column description (semantic tag already stripped)
+      - semantic: str | None — parsed semantic tag value
+
+    table_comment: COMMENT ON TABLE text; maps to business_description when non-empty.
+    role_context: list of {role: str, queries: list[str]} scoped to this entity.
     """
+    _role_context = role_context or []
+
     # Derive snake_case table name and PascalCase entity name
     snake_table = _pascal_to_snake(table) if not re.match(r'^[a-z][a-z0-9_]*$', table) else table
     entity = _snake_to_entity(snake_table)
@@ -180,6 +258,14 @@ async def scaffold_from_columns(
             field_def["db_column_name"] = col_name
         if field_type == "enum":
             field_def["enumRef"] = "# TODO: set enum name"
+        # Map column comment → description (omit key if empty)
+        col_comment = col.get("comment", "").strip()
+        if col_comment:
+            field_def["description"] = col_comment
+        # Map semantic tag (omit key if None)
+        col_semantic = col.get("semantic")
+        if col_semantic:
+            field_def["semantic"] = col_semantic
         fields.append(field_def)
 
     patterns_filename = f"{snake_table}.patterns.yaml"
@@ -192,7 +278,6 @@ async def scaffold_from_columns(
         "entity": entity,
         "table": snake_table,
         "adapter": adapter_key,
-        "description": f"# TODO: describe {entity}",
         "schema_name": schema,
         "fields": fields,
         "display": {
@@ -209,6 +294,13 @@ async def scaffold_from_columns(
         "write_permissions": [],
     }
 
+    # business_description: use table comment when present, omit key entirely otherwise
+    if table_comment:
+        skill_data["business_description"] = table_comment
+    else:
+        # No TODO placeholder — omit the key entirely per spec
+        skill_data["description"] = ""
+
     if db_table_name:
         skill_data["db_table_name"] = db_table_name
 
@@ -221,11 +313,11 @@ async def scaffold_from_columns(
     patterns = _build_patterns(entity, snake_table, columns)
 
     if llm_seeder is not None:
-        # Build a minimal context from just this entity when no full schema was provided
         ctx = full_schema_context or llm_seeder.build_full_schema_context(
             {entity: skill_yaml}, {}
         )
-        llm_patterns = await llm_seeder.seed_patterns(entity, skill_yaml, ctx)
+        role_section = _build_role_context_section(entity, _role_context)
+        llm_patterns = await llm_seeder.seed_patterns(entity, skill_yaml, ctx, role_section=role_section)
         if llm_patterns:
             existing_ids = {p["id"] for p in patterns}
             for lp in llm_patterns:
@@ -234,6 +326,22 @@ async def scaffold_from_columns(
                     existing_ids.add(lp["id"])
             log.info("scaffolder.llm_patterns_merged",
                      entity=entity, count=len(llm_patterns))
+
+    # Write domain_roles back into skill YAML if role_context was used
+    if _role_context:
+        # Strip comment header lines before parsing YAML
+        yaml_body = "\n".join(
+            line for line in skill_yaml.splitlines() if not line.startswith("#")
+        )
+        skill_raw = yaml.safe_load(yaml_body) or {}
+        skill_raw["domain_roles"] = [
+            {"role": e["role"], "typical_queries": e["queries"]} for e in _role_context
+        ]
+        skill_yaml = SCAFFOLD_HEADER + yaml.dump(
+            skill_raw, default_flow_style=False, sort_keys=False, allow_unicode=True
+        )
+        # Recompute hash since skill YAML changed
+        skill_hash = _compute_hash(skill_yaml)
 
     patterns_data = {"entity": entity, "patterns": patterns}
     patterns_yaml = (
@@ -245,18 +353,7 @@ async def scaffold_from_columns(
     # ── widget entries ────────────────────────────────────────────────────────
     widgets: list[dict] = []
     for pattern in patterns:
-        pattern_id = pattern["id"]
-        pattern_name = pattern_id.split(".")[-1]
-        widgets.append({
-            "id": f"{snake_table}_{pattern_name}",
-            "title": f"{entity} — {pattern_name.replace('_', ' ').title()}",
-            "description": pattern.get("description", ""),
-            "entity": entity,
-            "pattern_id": pattern_id,
-            "category": "# TODO: set category",
-            "icon": "table",
-            "params": pattern.get("params", []),
-        })
+        widgets.append(_widget_for_pattern(snake_table, entity, pattern, _role_context))
 
     log.info(
         "scaffolder.generated",
@@ -274,11 +371,14 @@ def _merge_llm_patterns(
     output: ScaffoldOutput,
     entity: str,
     llm_patterns: list[dict],
+    role_context: list[dict] | None = None,
 ) -> tuple[ScaffoldOutput, list[dict]]:
     """
     Merge LLM-generated patterns into an existing ScaffoldOutput.
     Returns the updated ScaffoldOutput and the list of newly added widgets.
     """
+    _role_context = role_context or []
+
     # Parse the existing patterns_yaml, skipping header lines
     lines = output.patterns_yaml.split("\n")
     skip = sum(
@@ -289,6 +389,9 @@ def _merge_llm_patterns(
     body = "\n".join(lines[skip:])
     raw = yaml.safe_load(body) or {}
     raw.setdefault("patterns", [])
+
+    # Derive snake_table from entity name for widget IDs
+    snake_table = _pascal_to_snake(entity)
 
     existing_ids = {p["id"] for p in raw["patterns"]}
     added: list[dict] = []
@@ -306,20 +409,9 @@ def _merge_llm_patterns(
         (header + "\n" if header else "")
         + yaml.dump(raw, default_flow_style=False, sort_keys=False, allow_unicode=True)
     )
-    entity_lower = entity.lower()
     new_widgets = []
     for lp in added:
-        pattern_name = lp["id"].split(".")[-1]
-        new_widgets.append({
-            "id": f"{entity_lower}_{pattern_name}",
-            "title": f"{entity} — {pattern_name.replace('_', ' ').title()}",
-            "description": lp.get("description", ""),
-            "entity": entity,
-            "pattern_id": lp["id"],
-            "category": "# TODO: set category",
-            "icon": "table",
-            "params": lp.get("params", []),
-        })
+        new_widgets.append(_widget_for_pattern(snake_table, entity, lp, _role_context))
 
     updated = ScaffoldOutput(
         skill_yaml=output.skill_yaml,
@@ -337,20 +429,60 @@ async def scaffold_table(
     *,
     llm_seeder: "PatternSeeder | None" = None,
     full_schema_context: str = "",
+    role_context: list[dict] | None = None,
+    metering_service: "MeteringService | None" = None,
 ) -> ScaffoldOutput:
     """
     Inspect a live PostgreSQL table and return a ScaffoldOutput.
     Requires an active adapter connection.
     """
+    import time as _time
     from backend.adapters.postgresql.schema_inspector import SchemaInspector
 
     inspector = SchemaInspector(adapter_key)
-    columns = await inspector.inspect_table(table_name, schema_name)
-    return await scaffold_from_columns(
-        table_name, schema_name, adapter_key, columns,
-        output_dir,
-        llm_seeder=llm_seeder, full_schema_context=full_schema_context,
-    )
+    columns, table_comment = await inspector.inspect_table(table_name, schema_name)
+
+    operation_id = None
+    metering_ctx_token = None
+    t0 = _time.monotonic()
+
+    if metering_service is not None and llm_seeder is not None:
+        from backend.metering.context import MeteringContext, clear_metering_context, set_metering_context
+        from backend.metering.dto.operation_dto import OperationUpdateDTO
+        operation_id = await metering_service.start_operation(
+            operation_type="scaffold_table",
+            metadata={"table": table_name, "schema": schema_name},
+        )
+        metering_ctx_token = set_metering_context(
+            MeteringContext(
+                operation_id=operation_id,
+                interaction_type="pattern_seeding",
+            )
+        )
+
+    try:
+        return await scaffold_from_columns(
+            table_name, schema_name, adapter_key, columns,
+            output_dir,
+            table_comment=table_comment,
+            llm_seeder=llm_seeder,
+            full_schema_context=full_schema_context,
+            role_context=role_context,
+        )
+    finally:
+        if metering_ctx_token is not None:
+            from backend.metering.context import clear_metering_context
+            clear_metering_context(metering_ctx_token)
+        if metering_service is not None and operation_id is not None:
+            from backend.metering.dto.operation_dto import OperationUpdateDTO
+            await metering_service.complete_operation(
+                operation_id,
+                OperationUpdateDTO(
+                    entity=table_name,
+                    success=True,
+                    duration_ms=int((_time.monotonic() - t0) * 1000),
+                ),
+            )
 
 
 async def scaffold_schema(
@@ -360,10 +492,14 @@ async def scaffold_schema(
     *,
     llm_seeder: "PatternSeeder | None" = None,
     llm_batch_size: int = 5,
+    role_context_map: dict[str, list[dict]] | None = None,
+    metering_service: "MeteringService | None" = None,
 ) -> dict[str, ScaffoldOutput]:
     """
     Inspect all tables in a PostgreSQL schema and return {table_name: ScaffoldOutput}.
     If output_dir is provided, writes *.skill.yaml, *.patterns.yaml, and widgets.yaml to disk.
+
+    role_context_map: {entity_name: [{role, queries}]} pre-built from the context file.
 
     When llm_seeder is provided:
     - Single DB pass to scaffold all tables with heuristic patterns.
@@ -375,6 +511,8 @@ async def scaffold_schema(
     import yaml as _yaml_mod
     from backend.adapters.postgresql.schema_inspector import SchemaInspector
 
+    _role_context_map = role_context_map or {}
+
     inspector = SchemaInspector(adapter_key)
     tables = await inspector.list_tables(schema_name)
     results: dict[str, ScaffoldOutput] = {}
@@ -382,7 +520,13 @@ async def scaffold_schema(
 
     # Single DB pass — heuristic scaffold for all tables
     for table in tables:
-        output = await scaffold_table(adapter_key, table, schema_name, output_dir)
+        snake = _pascal_to_snake(table) if not _re.match(r'^[a-z][a-z0-9_]*$', table) else table
+        entity = _snake_to_entity(snake)
+        entity_role_ctx = _role_context_map.get(entity, [])
+        output = await scaffold_table(
+            adapter_key, table, schema_name, output_dir,
+            role_context=entity_role_ctx,
+        )
         results[table] = output
         all_widgets.extend(output.widgets)
 
@@ -411,14 +555,52 @@ async def scaffold_schema(
         # Batch LLM calls — ceil(N / llm_batch_size) total calls
         table_list = list(tables)
         for i in range(0, len(table_list), llm_batch_size):
+            import time as _time
             batch_tables = table_list[i:i + llm_batch_size]
             batch_skill_yamls = {
                 table_to_entity[t]: all_skill_yamls[table_to_entity[t]]
                 for t in batch_tables
             }
-            batch_patterns = await llm_seeder.seed_patterns_batch(
-                batch_skill_yamls, full_schema_context
-            )
+
+            # Metering: open an operation for this batch LLM call
+            _batch_op_id = None
+            _batch_ctx_token = None
+            _batch_t0 = _time.monotonic()
+            if metering_service is not None:
+                from backend.metering.context import MeteringContext, clear_metering_context, set_metering_context
+                from backend.metering.dto.operation_dto import OperationUpdateDTO
+                _batch_op_id = await metering_service.start_operation(
+                    operation_type="scaffold_schema",
+                    metadata={
+                        "schema": schema_name,
+                        "batch": i // llm_batch_size + 1,
+                        "entities": list(batch_skill_yamls.keys()),
+                    },
+                )
+                _batch_ctx_token = set_metering_context(
+                    MeteringContext(
+                        operation_id=_batch_op_id,
+                        interaction_type="pattern_seeding",
+                    )
+                )
+
+            try:
+                batch_patterns = await llm_seeder.seed_patterns_batch(
+                    batch_skill_yamls, full_schema_context, role_context_map=_role_context_map
+                )
+            finally:
+                if _batch_ctx_token is not None:
+                    from backend.metering.context import clear_metering_context
+                    clear_metering_context(_batch_ctx_token)
+                if metering_service is not None and _batch_op_id is not None:
+                    from backend.metering.dto.operation_dto import OperationUpdateDTO
+                    await metering_service.complete_operation(
+                        _batch_op_id,
+                        OperationUpdateDTO(
+                            success=True,
+                            duration_ms=int((_time.monotonic() - _batch_t0) * 1000),
+                        ),
+                    )
             log.info(
                 "scaffolder.llm_batch_complete",
                 batch=i // llm_batch_size + 1,
@@ -432,8 +614,9 @@ async def scaffold_schema(
                 llm_pats = batch_patterns.get(entity, [])
                 if not llm_pats:
                     continue
+                entity_role_ctx = _role_context_map.get(entity, [])
                 results[table], new_widgets = _merge_llm_patterns(
-                    results[table], entity, llm_pats
+                    results[table], entity, llm_pats, role_context=entity_role_ctx
                 )
                 # Replace widgets for this table in all_widgets
                 all_widgets = [w for w in all_widgets if w.get("entity") != entity]

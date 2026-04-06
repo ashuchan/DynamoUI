@@ -136,72 +136,6 @@ def entity_mutations(entity: str, registry: RegistryDep) -> list[dict]:
 # Resolve endpoint (NL input → intent classification)
 # ---------------------------------------------------------------------------
 
-# Synonyms for entity names that users commonly use in natural language.
-# Maps lowercase synonym → registered entity name.
-_ENTITY_SYNONYMS: dict[str, str] = {
-    "song": "Track",
-    "songs": "Track",
-    "track": "Track",
-    "tracks": "Track",
-    "purchase": "Invoice",
-    "purchases": "Invoice",
-    "order": "Invoice",
-    "orders": "Invoice",
-    "sale": "Invoice",
-    "sales": "Invoice",
-    "invoice": "Invoice",
-    "invoices": "Invoice",
-    "line": "InvoiceLine",
-    "lines": "InvoiceLine",
-    "album": "Album",
-    "albums": "Album",
-    "artist": "Artist",
-    "artists": "Artist",
-    "customer": "Customer",
-    "customers": "Customer",
-    "employee": "Employee",
-    "employees": "Employee",
-    "genre": "Genre",
-    "genres": "Genre",
-    "media": "MediaType",
-    "mediatype": "MediaType",
-    "mediatypes": "MediaType",
-    "playlist": "Playlist",
-    "playlists": "Playlist",
-}
-
-
-def _extract_entity(query: str, known_entities: list[str]) -> str | None:
-    """
-    Scan the query for entity name keywords and return the entity whose
-    keyword appears earliest.  Falls back to checking registered entity
-    names directly (singular + plural) in case the synonym map is incomplete.
-    """
-    q_lower = query.lower()
-    words = q_lower.split()
-
-    best_pos: int = len(q_lower) + 1
-    best_entity: str | None = None
-
-    # Check synonym map
-    for word in words:
-        entity = _ENTITY_SYNONYMS.get(word)
-        if entity and entity in known_entities:
-            pos = q_lower.index(word)
-            if pos < best_pos:
-                best_pos = pos
-                best_entity = entity
-
-    # Check registered entity names directly (handles any entity not in map)
-    for entity in known_entities:
-        for candidate in (entity.lower(), entity.lower() + "s"):
-            idx = q_lower.find(candidate)
-            if idx != -1 and idx < best_pos:
-                best_pos = idx
-                best_entity = entity
-
-    return best_entity
-
 
 class ResolveRequest(BaseModel):
     input: str
@@ -217,119 +151,344 @@ class ResolveResponse(BaseModel):
     source: Literal["pattern_cache", "llm_synthesis", "none"] = "none"
 
 
+def _parse_pattern_template_to_plan(
+    query_template: str,
+    entity: str,
+) -> "Any | None":
+    """
+    Convert a pattern's query_template JSON string to a QueryPlan for execution.
+    Handles both the QuerySynthesiser format and the LLM-seeder format.
+    Returns None if the template cannot be parsed into an executable plan.
+    """
+    import json
+    from backend.adapters.base import (
+        QueryPlan, FilterClause, SortClause, JoinClause, AggregationClause
+    )
+
+    _OP_MAP = {
+        "equals": "eq", "eq": "eq", "=": "eq",
+        "not_equals": "ne", "ne": "ne",
+        "gt": "gt", "greater_than": "gt",
+        "gte": "gte", "greater_than_or_equal": "gte",
+        "lt": "lt", "less_than": "lt",
+        "lte": "lte", "less_than_or_equal": "lte",
+        "like": "like", "ilike": "like", "contains": "like",
+        "in": "in", "is_null": "is_null",
+    }
+    _FUNC_MAP = {
+        "count": "count", "sum": "sum", "avg": "avg", "min": "min", "max": "max",
+        "COUNT": "count", "SUM": "sum", "AVG": "avg", "MIN": "min", "MAX": "max",
+    }
+
+    try:
+        data = json.loads(query_template)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+    filters = []
+    for f in data.get("filters", []):
+        raw_op = f.get("op") or f.get("operator", "eq")
+        op = _OP_MAP.get(str(raw_op).lower(), "eq")
+        val = f.get("value", "")
+        # Skip unfilled param placeholders like "{artist_id}" or "{{name}}"
+        if isinstance(val, str) and val.startswith("{") and val.endswith("}"):
+            continue
+        try:
+            filters.append(FilterClause(field=str(f["field"]), op=op, value=val))
+        except (KeyError, Exception):
+            continue
+
+    sort = []
+    for s in data.get("sort", []):
+        direction = str(s.get("direction") or s.get("dir") or "asc").lower()
+        if direction not in ("asc", "desc"):
+            direction = "asc"
+        try:
+            sort.append(SortClause(field=str(s["field"]), dir=direction))
+        except (KeyError, Exception):
+            continue
+
+    joins = []
+    for j in data.get("joins", []):
+        join_type = str(j.get("join_type") or j.get("type") or "inner").lower()
+        if join_type not in ("inner", "left"):
+            join_type = "inner"
+        if "source_field" in j and "target_entity" in j and "target_field" in j:
+            joins.append(JoinClause(
+                source_field=j["source_field"], target_entity=j["target_entity"],
+                target_field=j["target_field"], join_type=join_type,
+            ))
+        elif "left_key" in j and "right_key" in j and "entity" in j:
+            joins.append(JoinClause(
+                source_field=j["left_key"], target_entity=j["entity"],
+                target_field=j["right_key"], join_type=join_type,
+            ))
+        elif "on" in j and "entity" in j:
+            on_clause = str(j["on"])
+            parts = [p.strip() for p in on_clause.split("=", 1)]
+            if len(parts) == 2 and "." in parts[0] and "." in parts[1]:
+                source_field = parts[0].split(".", 1)[1]
+                target_field = parts[1].split(".", 1)[1]
+                joins.append(JoinClause(
+                    source_field=source_field, target_entity=j["entity"],
+                    target_field=target_field, join_type=join_type,
+                ))
+
+    aggregations = []
+    for a in data.get("aggregations", []):
+        raw_func = a.get("func") or a.get("function", "count")
+        func = _FUNC_MAP.get(str(raw_func), "count")
+        try:
+            aggregations.append(AggregationClause(
+                func=func, field=str(a["field"]), alias=str(a["alias"])
+            ))
+        except (KeyError, Exception):
+            continue
+
+    result_limit = data.get("result_limit")
+    if isinstance(result_limit, str):
+        try:
+            result_limit = int(result_limit)
+        except ValueError:
+            result_limit = None
+
+    return QueryPlan(
+        entity=entity,
+        filters=filters,
+        sort=sort,
+        joins=joins,
+        aggregations=aggregations,
+        group_by=[str(g) for g in data.get("group_by", [])],
+        result_limit=result_limit,
+        page=1,
+        page_size=result_limit or 25,
+    )
+
+
+async def _execute_pattern(
+    pattern_id: str,
+    entity: str,
+    pattern_cache: Any,
+    registry: "SkillRegistry",
+    input_hash: str,
+) -> "dict | None":
+    """
+    Fetch a pattern's query_template, parse it to a QueryPlan, and execute it.
+    Returns {rows, total_count} or None if anything fails.
+    """
+    from backend.adapters.registry import get_adapter_registry
+
+    pattern = pattern_cache.get_pattern(pattern_id)
+    if pattern is None:
+        log.warning("api.resolve.pattern_not_found", pattern_id=pattern_id,
+                    input_hash=input_hash)
+        return None
+
+    query_template = (
+        pattern.query_template
+        if hasattr(pattern, "query_template")
+        else (pattern.get("query_template", "{}") if isinstance(pattern, dict) else "{}")
+    )
+
+    plan = _parse_pattern_template_to_plan(query_template, entity)
+    if plan is None:
+        log.warning("api.resolve.template_parse_failed", pattern_id=pattern_id,
+                    input_hash=input_hash)
+        return None
+
+    skill = registry.entity_by_name.get(entity)
+    if skill is None:
+        return None
+
+    adapter_reg = get_adapter_registry()
+    adapter = adapter_reg.get(skill.adapter)
+    if adapter is None:
+        return None
+
+    try:
+        exec_result = await adapter.execute_query(skill, plan)
+        return {"rows": exec_result.rows, "total_count": exec_result.total_count}
+    except Exception as exc:
+        log.warning("api.resolve.pattern_execute_failed", pattern_id=pattern_id,
+                    error=str(exc), input_hash=input_hash)
+        return None
+
+
 @router.post("/resolve", summary="Classify NL input + return QueryPlan")
 async def resolve_input(body: ResolveRequest, request: Request) -> ResolveResponse:
     """
     Intent resolution pipeline:
-    1. Rule engine (fast, 0 LLM calls)
-    2. Pattern cache lookup (fuzzy match, 0 LLM calls if hit >= 0.90)
-    3. LLM fallback for confidence < 0.80 (Phase 2)
+    1. Pattern cache lookup — on hit (≥ 0.90) execute the pattern's query_template
+    2. LLM synthesis — on cache miss, synthesise a QueryPlan and execute it
+    On failure: returns confidence=0.0, source="none". No silent fallbacks.
     """
+    import time as _time
     from backend.pattern_cache.cache.pattern_cache import PatternCache
 
     raw_input = body.input
     if len(raw_input) > 500:
         raise HTTPException(status_code=400, detail="Input exceeds 500 character limit")
 
-    # Hash input for safe logging (never log raw user input)
     input_hash = hashlib.sha256(raw_input.encode()).hexdigest()[:16]
+    input_hash_full = hashlib.sha256(raw_input.encode()).hexdigest()
     log.info("api.resolve.request", input_hash=input_hash, length=len(raw_input))
 
+    registry: SkillRegistry = request.app.state.skill_registry
     pattern_cache: PatternCache = getattr(request.app.state, "pattern_cache", None)
+
     if pattern_cache is None:
         log.warning("api.resolve.no_pattern_cache")
         return ResolveResponse(intent="READ")
 
-    result = pattern_cache.lookup(raw_input)
-    if result is None or result.tier == "cache_miss":
-        log.info("api.resolve.cache_miss", input_hash=input_hash)
-        # Entity-name extraction fallback: navigate to the entity the user
-        # mentioned even if we can't parse the full query semantics.
-        registry: SkillRegistry = request.app.state.skill_registry
-        known = list(registry.entity_by_name.keys())
-        entity = _extract_entity(raw_input, known)
-        if entity:
-            log.info("api.resolve.entity_extracted", entity=entity, input_hash=input_hash)
-            return ResolveResponse(intent="READ", entity=entity, confidence=0.5)
+    # ── Metering: open an operation row ────────────────────────────────────────
+    from backend.metering.context import MeteringContext, clear_metering_context, set_metering_context
+    from backend.metering.dto.operation_dto import OperationUpdateDTO
 
-        # --- LLM synthesis fallback ---
-        from backend.skill_registry.llm.query_synthesiser import QuerySynthesiser
-        from backend.skill_registry.config.settings import llm_settings
+    metering_svc = getattr(request.app.state, "metering_service", None)
+    t0 = _time.monotonic()
+    operation_id = None
+    metering_ctx_token = None
 
-        synthesiser: QuerySynthesiser = getattr(request.app.state, "query_synthesiser", None)
-        if synthesiser is None:
-            return ResolveResponse(intent="READ", confidence=0.0, source="none")
-
-        query_plan_and_confidence = await synthesiser.synthesise(raw_input, registry)
-        if query_plan_and_confidence is None:
-            return ResolveResponse(intent="READ", confidence=0.0, source="none")
-        query_plan, synthesis_confidence = query_plan_and_confidence
-
-        skill = registry.entity_by_name.get(query_plan.entity)
-        if skill is None:
-            return ResolveResponse(intent="READ", confidence=0.0, source="none")
-
-        from backend.adapters.registry import get_adapter_registry
-        adapter_reg = get_adapter_registry()
-        adapter = adapter_reg.get(skill.adapter)
-        if adapter is None:
-            return ResolveResponse(intent="READ", confidence=0.0, source="none")
-
-        try:
-            result = await adapter.execute_query(skill, query_plan)
-        except Exception as exc:
-            log.warning("api.resolve.execute_failed", error=str(exc), input_hash=input_hash)
-            return ResolveResponse(intent="READ", confidence=0.0, source="none")
-
-        # Async promotion — fire and forget, never blocks response
-        promoter = getattr(request.app.state, "pattern_promoter", None)
-        if promoter is not None:
-            import asyncio
-            asyncio.create_task(
-                promoter.promote(
-                    user_input=raw_input,
-                    query_plan=query_plan,
-                    confidence=synthesis_confidence,
-                    entity=query_plan.entity,
-                )
+    if metering_svc is not None:
+        client_ip = (
+            request.client.host if request.client else None
+        )
+        operation_id = await metering_svc.start_operation(
+            operation_type="resolve",
+            user_input_hash=input_hash_full,
+            ip_address=client_ip,
+        )
+        metering_ctx_token = set_metering_context(
+            MeteringContext(
+                operation_id=operation_id,
+                interaction_type="query_synthesis",
             )
-
-        log.info("api.resolve.llm_synthesis", input_hash=input_hash, entity=query_plan.entity)
-        return ResolveResponse(
-            intent="READ",
-            entity=query_plan.entity,
-            confidence=synthesis_confidence,
-            query_plan={"rows": result.rows, "total_count": result.total_count},
-            source="llm_synthesis",
         )
 
-    log.info(
-        "api.resolve.cache_hit",
-        input_hash=input_hash,
-        pattern_id=result.pattern_id,
-        confidence=result.confidence,
-    )
+    response: ResolveResponse | None = None
+    success = True
+    error_msg: str | None = None
 
-    if result.confidence >= 0.90:
-        return ResolveResponse(
-            intent="READ",
-            entity=result.entity,
-            pattern_id=result.pattern_id,
-            confidence=result.confidence,
-            source="pattern_cache",
-        )
-    elif result.confidence >= 0.80:
-        return ResolveResponse(
-            intent="READ",
-            entity=result.entity,
-            pattern_id=result.pattern_id,
-            confidence=result.confidence,
-            did_you_mean=result.matched_trigger,
-            source="pattern_cache",
-        )
-    else:
-        # < 0.80 — cache miss, LLM fallback (Phase 2 stub)
-        return ResolveResponse(intent="READ", confidence=result.confidence)
+    try:
+        cache_result = pattern_cache.lookup(raw_input)
+
+        # ── 1. Pattern cache hit (≥ 0.90) — execute and return rows ─────────
+        if (
+            cache_result is not None
+            and cache_result.confidence is not None
+            and cache_result.confidence >= 0.90
+        ):
+            log.info("api.resolve.cache_hit",
+                     input_hash=input_hash,
+                     pattern_id=cache_result.pattern_id,
+                     confidence=cache_result.confidence)
+
+            query_data = await _execute_pattern(
+                cache_result.pattern_id, cache_result.entity,
+                pattern_cache, registry, input_hash,
+            )
+            response = ResolveResponse(
+                intent="READ",
+                entity=cache_result.entity,
+                pattern_id=cache_result.pattern_id,
+                confidence=cache_result.confidence,
+                query_plan=query_data,
+                did_you_mean=(
+                    cache_result.matched_trigger
+                    if cache_result.confidence < 0.95 else None
+                ),
+                source="pattern_cache",
+            )
+            return response
+
+        # ── 2. LLM synthesis — handles complex cross-entity queries ──────────
+        synthesiser = getattr(request.app.state, "query_synthesiser", None)
+        if synthesiser is not None:
+            query_plan_and_confidence = await synthesiser.synthesise(raw_input, registry)
+            if query_plan_and_confidence is not None:
+                query_plan, synthesis_confidence = query_plan_and_confidence
+                skill = registry.entity_by_name.get(query_plan.entity)
+                if skill is not None:
+                    from backend.adapters.registry import get_adapter_registry
+                    adapter_reg = get_adapter_registry()
+                    adapter = adapter_reg.get(skill.adapter)
+                    if adapter is not None:
+                        try:
+                            exec_result = await adapter.execute_query(skill, query_plan)
+
+                            # Async promotion — fire and forget, never blocks response
+                            promoter = getattr(request.app.state, "pattern_promoter", None)
+                            if promoter is not None:
+                                import asyncio
+                                asyncio.create_task(
+                                    promoter.promote(
+                                        user_input=raw_input,
+                                        query_plan=query_plan,
+                                        confidence=synthesis_confidence,
+                                        entity=query_plan.entity,
+                                    )
+                                )
+
+                            log.info("api.resolve.llm_synthesis",
+                                     input_hash=input_hash, entity=query_plan.entity,
+                                     confidence=synthesis_confidence)
+                            response = ResolveResponse(
+                                intent="READ",
+                                entity=query_plan.entity,
+                                confidence=synthesis_confidence,
+                                query_plan={
+                                    "rows": exec_result.rows,
+                                    "total_count": exec_result.total_count,
+                                },
+                                source="llm_synthesis",
+                            )
+                            return response
+                        except Exception as exc:
+                            log.warning("api.resolve.llm_execute_failed",
+                                        error=str(exc), input_hash=input_hash)
+                            error_msg = str(exc)[:1000]
+                            success = False
+
+        log.info("api.resolve.unresolved", input_hash=input_hash)
+        response = ResolveResponse(intent="READ", confidence=0.0, source="none")
+        return response
+
+    except Exception:
+        success = False
+        raise
+
+    finally:
+        # ── Metering: close the operation row ─────────────────────────────────
+        if metering_ctx_token is not None:
+            clear_metering_context(metering_ctx_token)
+        if metering_svc is not None and operation_id is not None:
+            rows = None
+            entity = None
+            pattern_id = None
+            cache_hit = None
+            confidence = None
+            if response is not None:
+                rows = (
+                    response.query_plan.get("total_count")
+                    if isinstance(response.query_plan, dict) else None
+                )
+                entity = response.entity
+                pattern_id = response.pattern_id
+                cache_hit = response.source == "pattern_cache"
+                confidence = response.confidence
+            await metering_svc.complete_operation(
+                operation_id,
+                OperationUpdateDTO(
+                    entity=entity,
+                    pattern_id=pattern_id,
+                    cache_hit=cache_hit,
+                    confidence=confidence,
+                    success=success,
+                    error_message=error_msg,
+                    rows_returned=rows,
+                    duration_ms=int((_time.monotonic() - t0) * 1000),
+                ),
+            )
 
 
 # ---------------------------------------------------------------------------

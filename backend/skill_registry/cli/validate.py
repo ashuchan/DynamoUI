@@ -159,6 +159,38 @@ def validate_command(
 # ---------------------------------------------------------------------------
 
 
+def _load_context_file(path: Path) -> dict[str, list[dict]]:
+    """
+    Load a business_context.yaml and return {entity_name: [{role, queries}]}.
+    Roles with no 'entities' key apply to ALL entities (resolved later by caller).
+    """
+    import yaml as _yaml
+    raw = _yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    roles = raw.get("roles", [])
+    # Return the raw role list; entity scoping resolved per entity in scaffold calls
+    # Returns {entity: [{role, queries}]} for scoped roles, plus a special
+    # "" key for unscoped roles (applies to all entities)
+    result: dict[str, list[dict]] = {}
+    for role_entry in roles:
+        role_name = role_entry.get("name", "")
+        queries = role_entry.get("queries", [])
+        entities = role_entry.get("entities")  # None means "all entities"
+        if entities is None:
+            result.setdefault("", []).append({"role": role_name, "queries": queries})
+        else:
+            for entity in entities:
+                result.setdefault(entity, []).append({"role": role_name, "queries": queries})
+    return result
+
+
+def _build_entity_role_context(
+    entity: str,
+    context_map: dict[str, list[dict]],
+) -> list[dict]:
+    """Merge scoped roles for entity + global (unscoped) roles."""
+    return context_map.get(entity, []) + context_map.get("", [])
+
+
 @cli.command("scaffold")
 @click.option(
     "--adapter",
@@ -183,6 +215,11 @@ def validate_command(
     type=int,
     help="Number of entities per LLM call when --seed-patterns is active",
 )
+@click.option(
+    "--context-file",
+    default=None,
+    help="Path to a business_context.yaml with role-based query examples",
+)
 def scaffold_command(
     adapter: str,
     table: Optional[str],
@@ -192,11 +229,22 @@ def scaffold_command(
     dry_run: bool,
     seed_patterns: bool,
     llm_batch_size: int,
+    context_file: Optional[str],
 ) -> None:
     """Generate skill YAML from a live PostgreSQL table or schema."""
     from backend.adapters.registry import initialise_adapters
     from backend.skill_registry.config.settings import pg_settings, skill_settings
     from backend.skill_registry.scaffold.scaffolder import scaffold_schema, scaffold_table
+
+    # Validate --context-file before any DB connection
+    context_map: dict[str, list[dict]] = {}
+    if context_file is not None:
+        ctx_path = Path(context_file)
+        if not ctx_path.exists():
+            click.echo(f"ERROR: context file not found: {ctx_path}", err=True)
+            sys.exit(1)
+        context_map = _load_context_file(ctx_path)
+        click.echo(f"Loaded context file: {ctx_path}")
 
     async def _run() -> None:
         await initialise_adapters(skill_settings.adapters_registry, pg_settings)
@@ -212,7 +260,15 @@ def scaffold_command(
 
         if table:
             _single_out_dir = Path(output_path).parent if output_path else None
-            output = await scaffold_table(adapter, table, schema, _single_out_dir, llm_seeder=seeder)
+            # Derive entity name for single-table context lookup
+            from backend.skill_registry.scaffold.scaffolder import _pascal_to_snake, _snake_to_entity
+            _snake = _pascal_to_snake(table) if not table.islower() else table
+            _entity = _snake_to_entity(_snake)
+            entity_role_ctx = _build_entity_role_context(_entity, context_map)
+            output = await scaffold_table(
+                adapter, table, schema, _single_out_dir,
+                llm_seeder=seeder, role_context=entity_role_ctx,
+            )
             if dry_run or not output_path:
                 click.echo(output.skill_yaml)
                 click.echo(f"--- {table}.patterns.yaml ---")
@@ -236,7 +292,28 @@ def scaffold_command(
         elif output_dir:
             out_dir = Path(output_dir)
             out_dir.mkdir(parents=True, exist_ok=True)
-            results = await scaffold_schema(adapter, schema, out_dir if not dry_run else None, llm_seeder=seeder, llm_batch_size=llm_batch_size)
+            # Build full entity→role_context map for scaffold_schema
+            # scaffold_schema will call _build_entity_role_context per entity internally
+            # We pass the raw context_map; scaffold_schema merges scoped + global roles
+            # by calling _build_entity_role_context for each entity discovered
+            from backend.skill_registry.scaffold.scaffolder import (
+                _pascal_to_snake, _snake_to_entity,
+            )
+            from backend.adapters.postgresql.schema_inspector import SchemaInspector
+            from backend.adapters.registry import initialise_adapters as _ia
+            inspector = SchemaInspector(adapter)
+            tables_list = await inspector.list_tables(schema)
+            role_context_map: dict[str, list[dict]] = {}
+            for tbl in tables_list:
+                _snake = _pascal_to_snake(tbl) if not tbl.islower() else tbl
+                _entity = _snake_to_entity(_snake)
+                role_context_map[_entity] = _build_entity_role_context(_entity, context_map)
+
+            results = await scaffold_schema(
+                adapter, schema, out_dir if not dry_run else None,
+                llm_seeder=seeder, llm_batch_size=llm_batch_size,
+                role_context_map=role_context_map,
+            )
             if dry_run:
                 for tbl, output in results.items():
                     click.echo(f"--- {tbl}.skill.yaml ---")

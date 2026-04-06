@@ -114,7 +114,15 @@ class PostgreSQLAdapter(DataAdapter):
 
         table = self._table_builder.build(skill)
         pk_col_name = skill.pk_field.db_column_name or skill.pk_field.name
-        stmt = sa.select(table).where(table.c[pk_col_name] == pk_value)
+        pk_type = skill.pk_field.type
+        try:
+            if pk_type in ("integer", "float"):
+                typed_pk: object = int(pk_value) if pk_type == "integer" else float(pk_value)
+            else:
+                typed_pk = pk_value
+        except (ValueError, TypeError):
+            typed_pk = pk_value
+        stmt = sa.select(table).where(table.c[pk_col_name] == typed_pk)
 
         async with self._engine.read_engine.connect() as conn:
             result = await conn.execute(stmt)

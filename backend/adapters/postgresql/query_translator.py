@@ -5,6 +5,7 @@ Rules:
 - All SQL is built via SQLAlchemy Core parameterised builders.
 - No string concatenation in query construction.
 - New filter operators: add a lambda to FILTER_OPS only.
+- Field resolution always goes through _resolve_col (snake_case → db_column_name).
 """
 from __future__ import annotations
 
@@ -21,9 +22,11 @@ log = structlog.get_logger(__name__)
 class QueryTranslator:
     """
     Translates a QueryPlan into an executable SQLAlchemy select statement.
+    All field-name resolution goes through _resolve_col so that snake_case
+    logical names (from the skill schema) map correctly to PascalCase DB column
+    names (e.g. album_id → AlbumId in Chinook).
     """
 
-    # Locked operator set — add new ops here only, never via string SQL
     FILTER_OPS = {
         "eq":      lambda c, v: c == v,
         "ne":      lambda c, v: c != v,
@@ -44,6 +47,10 @@ class QueryTranslator:
         self._table_builder = table_builder
         self._skill_registry = skill_registry
 
+    # ------------------------------------------------------------------
+    # Public
+    # ------------------------------------------------------------------
+
     def build_select(
         self,
         skill: EntitySkill,
@@ -57,22 +64,32 @@ class QueryTranslator:
 
         # Column selection
         if plan.select_fields:
-            cols = [table.c[f] for f in plan.select_fields if f in table.c]
+            cols = [
+                self._resolve_col(table, f, skill)
+                for f in plan.select_fields
+                if self._resolve_col(table, f, skill) is not None
+            ]
+            if not cols:
+                cols = [table]
         else:
             cols = [table]
 
         stmt = sa.select(*cols)
         count_stmt = sa.select(sa.func.count()).select_from(table)
 
-        # Filters
+        # Filters on primary table
         for f in plan.filters:
             stmt, count_stmt = self._apply_filter(table, stmt, count_stmt, f, skill)
 
-        # Joins
+        # Joins — resolve each side through _resolve_col so snake_case works
         joined_tables: dict[str, sa.Table] = {}
+        joined_skills: dict[str, EntitySkill] = {}
+
         if plan.joins:
             if self._skill_registry is None:
-                raise ValueError("QueryTranslator requires skill_registry to resolve joins")
+                raise ValueError(
+                    "QueryTranslator requires skill_registry to resolve joins"
+                )
             for join in plan.joins:
                 target_skill = self._skill_registry.entity_by_name.get(join.target_entity)
                 if target_skill is None:
@@ -81,62 +98,110 @@ class QueryTranslator:
                         entity=join.target_entity,
                     )
                     continue
+
                 target_table = self._table_builder.build(target_skill)
                 joined_tables[join.target_entity] = target_table
-                condition = table.c[join.source_field] == target_table.c[join.target_field]
+                joined_skills[join.target_entity] = target_skill
+
+                # For multi-hop joins the source field may live on a previously
+                # joined table rather than the primary table (e.g. track_id is on
+                # Track, not Album, when joining Track→InvoiceLine).
+                src_col = self._resolve_any(
+                    join.source_field, table, skill, joined_tables, joined_skills
+                )
+                tgt_col = self._resolve_col(target_table, join.target_field, target_skill)
+
+                if src_col is None:
+                    log.warning(
+                        "query_translator.join_source_field_not_found",
+                        field=join.source_field,
+                        entity=skill.entity,
+                    )
+                    continue
+                if tgt_col is None:
+                    log.warning(
+                        "query_translator.join_target_field_not_found",
+                        field=join.target_field,
+                        entity=join.target_entity,
+                    )
+                    continue
+
+                condition = src_col == tgt_col
                 if join.join_type == "inner":
                     stmt = stmt.join(target_table, condition)
+                    count_stmt = count_stmt.join(target_table, condition)
                 else:
                     stmt = stmt.outerjoin(target_table, condition)
+                    count_stmt = count_stmt.outerjoin(target_table, condition)
 
         # Aggregations
-        if plan.aggregations:
-            def resolve_col_multi(field_name: str) -> sa.Column | None:
-                col = self._resolve_col(table, field_name, skill)
-                if col is not None:
-                    return col
-                for tbl in joined_tables.values():
-                    if field_name in tbl.c:
-                        return tbl.c[field_name]
-                return None
+        aggregation_aliases: set[str] = {agg.alias for agg in plan.aggregations}
 
+        if plan.aggregations:
             agg_cols = []
             for agg in plan.aggregations:
-                if agg.func == "count" and agg.field == "*":
+                col = self._resolve_any(
+                    agg.field, table, skill, joined_tables, joined_skills
+                )
+                if agg.func == "count" and (agg.field == "*" or col is None):
                     agg_cols.append(sa.func.count().label(agg.alias))
+                elif col is None:
+                    log.warning(
+                        "query_translator.agg_field_not_found",
+                        field=agg.field,
+                        entity=skill.entity,
+                    )
+                    continue
                 elif agg.func == "count":
-                    col = resolve_col_multi(agg.field)
-                    if col is not None:
-                        agg_cols.append(sa.func.count(col).label(agg.alias))
+                    agg_cols.append(sa.func.count(col).label(agg.alias))
                 elif agg.func == "sum":
-                    col = resolve_col_multi(agg.field)
-                    if col is not None:
-                        agg_cols.append(sa.func.sum(col).label(agg.alias))
+                    agg_cols.append(sa.func.sum(col).label(agg.alias))
                 elif agg.func == "avg":
-                    col = resolve_col_multi(agg.field)
-                    if col is not None:
-                        agg_cols.append(sa.func.avg(col).label(agg.alias))
+                    agg_cols.append(sa.func.avg(col).label(agg.alias))
                 elif agg.func == "min":
-                    col = resolve_col_multi(agg.field)
-                    if col is not None:
-                        agg_cols.append(sa.func.min(col).label(agg.alias))
+                    agg_cols.append(sa.func.min(col).label(agg.alias))
                 elif agg.func == "max":
-                    col = resolve_col_multi(agg.field)
-                    if col is not None:
-                        agg_cols.append(sa.func.max(col).label(agg.alias))
+                    agg_cols.append(sa.func.max(col).label(agg.alias))
+
             if agg_cols:
-                stmt = sa.select(*agg_cols).select_from(stmt.froms[0])
-                # Re-apply joins to the new select
+                # Rebuild select from the full join chain.
+                # Track which tables are in from_clause so far, so that multi-hop
+                # source fields (e.g. track_id on Track for Track→InvoiceLine) can
+                # be resolved against previously joined tables, not just the primary.
+                from_clause = table
+                agg_joined: dict[str, sa.Table] = {}
+                agg_joined_skills: dict[str, EntitySkill] = {}
                 for join in plan.joins:
                     target_table = joined_tables.get(join.target_entity)
                     if target_table is None:
                         continue
-                    condition = table.c[join.source_field] == target_table.c[join.target_field]
+                    t_skill = joined_skills.get(join.target_entity)
+                    src_col = self._resolve_any(
+                        join.source_field, table, skill, agg_joined, agg_joined_skills
+                    )
+                    tgt_col = self._resolve_col(target_table, join.target_field, t_skill)
+                    agg_joined[join.target_entity] = target_table
+                    agg_joined_skills[join.target_entity] = t_skill
+                    if src_col is None or tgt_col is None:
+                        continue
+                    condition = src_col == tgt_col
                     if join.join_type == "inner":
-                        stmt = stmt.join(target_table, condition)
+                        from_clause = from_clause.join(target_table, condition)
                     else:
-                        stmt = stmt.outerjoin(target_table, condition)
-                # Re-apply filters to aggregation stmt
+                        from_clause = from_clause.outerjoin(target_table, condition)
+
+                # Include group_by columns in SELECT so they appear in result rows
+                group_select_cols = []
+                for gf in plan.group_by:
+                    col = self._resolve_any(
+                        gf, table, skill, agg_joined, agg_joined_skills
+                    )
+                    if col is not None:
+                        group_select_cols.append(col)
+
+                stmt = sa.select(*group_select_cols, *agg_cols).select_from(from_clause)
+
+                # Re-apply primary filters on the aggregation query
                 for f in plan.filters:
                     col = self._resolve_col(table, f.field, skill)
                     if col is None:
@@ -148,41 +213,49 @@ class QueryTranslator:
 
         # Group by
         if plan.group_by:
-            def resolve_col_multi_gb(field_name: str) -> sa.Column | None:
-                col = self._resolve_col(table, field_name, skill)
-                if col is not None:
-                    return col
-                for tbl in joined_tables.values():
-                    if field_name in tbl.c:
-                        return tbl.c[field_name]
-                return None
-
             group_cols = []
             for gf in plan.group_by:
-                col = resolve_col_multi_gb(gf)
+                col = self._resolve_any(
+                    gf, table, skill, joined_tables, joined_skills
+                )
                 if col is not None:
                     group_cols.append(col)
+                else:
+                    log.warning(
+                        "query_translator.group_by_field_not_found",
+                        field=gf,
+                        entity=skill.entity,
+                    )
             if group_cols:
                 stmt = stmt.group_by(*group_cols)
 
-        # Sorting
+        # Sort — supports both real columns and aggregation aliases
         for sort in plan.sort:
-            col = self._resolve_col(table, sort.field, skill)
-            if col is None:
-                log.warning(
-                    "query_translator.unknown_sort_field",
-                    field=sort.field,
-                    entity=skill.entity,
+            if sort.field in aggregation_aliases:
+                label_col = sa.literal_column(sort.field)
+                stmt = stmt.order_by(
+                    label_col.asc() if sort.dir == "asc" else label_col.desc()
                 )
-                continue
-            stmt = stmt.order_by(col.asc() if sort.dir == "asc" else col.desc())
+            else:
+                col = self._resolve_any(
+                    sort.field, table, skill, joined_tables, joined_skills
+                )
+                if col is None:
+                    log.warning(
+                        "query_translator.unknown_sort_field",
+                        field=sort.field,
+                        entity=skill.entity,
+                    )
+                    continue
+                stmt = stmt.order_by(
+                    col.asc() if sort.dir == "asc" else col.desc()
+                )
 
         # Result limit (TOP N) — mutually exclusive with pagination
         if plan.result_limit is not None:
             stmt = stmt.limit(plan.result_limit)
             count_stmt = sa.select(sa.func.count()).select_from(stmt.subquery())
         else:
-            # Pagination
             offset = (plan.page - 1) * plan.page_size
             stmt = stmt.limit(plan.page_size).offset(offset)
 
@@ -193,10 +266,63 @@ class QueryTranslator:
             sort=len(plan.sort),
             joins=len(plan.joins),
             aggregations=len(plan.aggregations),
-            page=plan.page,
-            page_size=plan.page_size,
+            group_by=plan.group_by,
+            result_limit=plan.result_limit,
         )
         return stmt, count_stmt
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _resolve_col(
+        self, table: sa.Table, field_name: str, skill: EntitySkill | None
+    ) -> sa.Column | None:
+        """
+        Resolve a logical snake_case field name to its SQLAlchemy column.
+        Tries the name directly first (handles already-correct DB names),
+        then walks skill.fields to find the db_column_name mapping.
+        Returns None if the field cannot be resolved.
+        """
+        if not field_name:
+            return None
+        if field_name in table.c:
+            return table.c[field_name]
+        if skill is not None:
+            for f in skill.fields:
+                if f.name == field_name:
+                    db_name = f.db_column_name or f.name
+                    if db_name in table.c:
+                        return table.c[db_name]
+        return None
+
+    def _resolve_any(
+        self,
+        field_name: str,
+        primary_table: sa.Table,
+        primary_skill: EntitySkill,
+        joined_tables: dict[str, sa.Table],
+        joined_skills: dict[str, EntitySkill],
+    ) -> sa.Column | None:
+        """
+        Resolve a snake_case field name against the primary table first,
+        then all joined tables in declaration order.
+        Returns None if the field cannot be found anywhere.
+        """
+        if not field_name:
+            return None
+
+        col = self._resolve_col(primary_table, field_name, primary_skill)
+        if col is not None:
+            return col
+
+        for entity_name, tbl in joined_tables.items():
+            j_skill = joined_skills.get(entity_name)
+            col = self._resolve_col(tbl, field_name, j_skill)
+            if col is not None:
+                return col
+
+        return None
 
     def _apply_filter(
         self,
@@ -224,16 +350,3 @@ class QueryTranslator:
         stmt = stmt.where(condition)
         count_stmt = count_stmt.where(condition)
         return stmt, count_stmt
-
-    def _resolve_col(
-        self, table: sa.Table, field_name: str, skill: EntitySkill
-    ) -> sa.Column | None:
-        """Resolve a logical field name or db_column_name to its SQLAlchemy column."""
-        if field_name in table.c:
-            return table.c[field_name]
-        for f in skill.fields:
-            if f.name == field_name:
-                db_name = f.db_column_name or f.name
-                if db_name in table.c:
-                    return table.c[db_name]
-        return None

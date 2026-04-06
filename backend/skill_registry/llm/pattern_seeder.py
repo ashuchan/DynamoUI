@@ -74,9 +74,12 @@ class PatternSeeder:
         entity: str,
         skill_yaml: str,
         full_schema_context: str,
+        *,
+        role_section: str = "",
     ) -> list[dict]:
         """
         Call the LLM once with the full schema and return a list of pattern dicts.
+        role_section: pre-built 'Business use cases' text block appended to the prompt.
         Returns [] on any failure so the scaffolder can fall back to basic patterns.
         """
         import json
@@ -86,8 +89,11 @@ class PatternSeeder:
             f"Generate patterns for entity: {entity}\n"
             f"Skill YAML:\n{skill_yaml}"
         )
+        if role_section:
+            user_prompt += f"\n{role_section}"
         try:
-            raw = await self._provider.complete(SEED_SYSTEM_PROMPT, user_prompt)
+            llm_response = await self._provider.complete(SEED_SYSTEM_PROMPT, user_prompt)
+            raw = llm_response.text
             if not raw:
                 return []
             data = json.loads(strip_markdown_json(raw))
@@ -102,27 +108,53 @@ class PatternSeeder:
         self,
         batch_skill_yamls: dict[str, str],
         full_schema_context: str,
+        *,
+        role_context_map: dict[str, list[dict]] | None = None,
     ) -> dict[str, list[dict]]:
         """
         Call the LLM once for a batch of entities and return {entity: [patterns]}.
+        role_context_map: {entity_name: [{role, queries}]} injected into the prompt.
         Returns {} on any failure so the caller can skip the batch gracefully.
         batch_skill_yamls: {entity_name: skill_yaml_string} for entities in this batch.
         """
         import json
         from backend.skill_registry.llm.provider import strip_markdown_json
 
+        _role_context_map = role_context_map or {}
+
         entity_list = ", ".join(sorted(batch_skill_yamls.keys()))
         skill_block = "\n\n".join(
             f"Entity: {entity}\n{yaml_str}"
             for entity, yaml_str in sorted(batch_skill_yamls.items())
         )
+
+        # Build per-entity role sections and append to skill block
+        role_block_parts = []
+        for entity in sorted(batch_skill_yamls.keys()):
+            entity_roles = _role_context_map.get(entity, [])
+            if entity_roles:
+                lines = [f"\nBusiness use cases for {entity}:"]
+                for entry in entity_roles:
+                    lines.append(f"  {entry['role']} asks:")
+                    for q in entry["queries"]:
+                        lines.append(f'    - "{q}"')
+                role_block_parts.append("\n".join(lines))
+
         user_prompt = (
             f"Full schema:\n{full_schema_context}\n\n"
             f"Generate patterns for these entities: {entity_list}\n\n"
             f"{skill_block}"
         )
+        if role_block_parts:
+            user_prompt += (
+                "\n\n" + "\n".join(role_block_parts)
+                + "\n\nGenerate patterns that address these use cases directly. "
+                "Each query above should map to at least one pattern with that query "
+                "(or a close paraphrase) as a trigger."
+            )
         try:
-            raw = await self._provider.complete(BATCH_SEED_SYSTEM_PROMPT, user_prompt)
+            llm_response = await self._provider.complete(BATCH_SEED_SYSTEM_PROMPT, user_prompt)
+            raw = llm_response.text
             if not raw:
                 return {}
             data = json.loads(strip_markdown_json(raw))
@@ -141,9 +173,9 @@ class PatternSeeder:
         self, all_skill_yamls: dict[str, str], fk_edges: dict[str, list]
     ) -> str:
         """
-        Build the compact schema string used by QuerySynthesiser, but from raw YAML
-        strings rather than a live SkillRegistry (registry doesn't exist during scaffold).
-        Sensitive fields are excluded.
+        Build the enriched schema context string for LLM prompts.
+        Includes business_description, field descriptions, and semantic tags when present.
+        Sensitive fields are always excluded.
 
         all_skill_yamls: {entity_name: skill_yaml_string}
         fk_edges: {entity_name: [(source_field, target_entity, target_field)]}
@@ -154,12 +186,37 @@ class PatternSeeder:
             raw = yaml.safe_load(skill_yaml_str) or {}
             fields = raw.get("fields", [])
             non_sensitive = [f for f in fields if not f.get("sensitive", False)]
-            field_parts = [
-                f"{f['name']} ({f['type']}{' PK' if f.get('isPK') else ''})"
-                for f in non_sensitive
-            ]
+
             lines.append(f"Entity: {entity_name} (table: {raw.get('table', '')})")
-            lines.append(f"Fields: {', '.join(field_parts)}")
+
+            biz_desc = raw.get("business_description", "").strip()
+            if biz_desc:
+                lines.append(f"Business context: {biz_desc}")
+
+            # Use enriched field format when descriptions or semantics are present
+            has_enrichment = any(
+                f.get("description") or f.get("semantic") for f in non_sensitive
+            )
+            if has_enrichment:
+                lines.append("Fields:")
+                for f in non_sensitive:
+                    type_parts = [f["type"]]
+                    if f.get("isPK"):
+                        type_parts.append("PK")
+                    if f.get("semantic"):
+                        type_parts.append(f["semantic"])
+                    type_str = ", ".join(type_parts)
+                    field_line = f"  {f['name']} ({type_str})"
+                    if f.get("description"):
+                        field_line += f" — {f['description']}"
+                    lines.append(field_line)
+            else:
+                field_parts = [
+                    f"{f['name']} ({f['type']}{' PK' if f.get('isPK') else ''})"
+                    for f in non_sensitive
+                ]
+                lines.append(f"Fields: {', '.join(field_parts)}")
+
             edges = fk_edges.get(entity_name, [])
             if edges:
                 lines.append("FK: " + ", ".join(

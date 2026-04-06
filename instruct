@@ -1,0 +1,259 @@
+## CONTEXT
+
+DynamoUI scaffolds skill YAML files from a live PostgreSQL schema.
+The current scaffolder produces structurally correct but semantically
+empty output — field descriptions are blank, business_description is
+a TODO placeholder, and generated patterns are generic (list all,
+search by field).
+
+This brief adds two things:
+  1. Extract PostgreSQL table/column comments during scaffolding and
+     map them into skill YAML fields, including a [semantic:X] tag
+     convention parsed from column comments.
+  2. Accept a CLI input file of role-based query examples that, combined
+     with the enriched schema context, drives the LLM pattern seeder to
+     produce business-meaningful patterns and widgets instead of generic ones.
+
+These two features together eliminate the need for post-scaffold manual
+enrichment of business_description and field descriptions, and produce
+a pattern cache that reflects real business use cases from day one.
+
+---
+
+## FEATURE 1 — PostgreSQL comment extraction
+
+### What to build
+
+The SchemaInspector currently returns column descriptors with four fields:
+name, type, nullable, is_pk. Extend it to also return:
+  - table_comment: the table-level COMMENT ON TABLE value (string or empty)
+  - column comment: per-column COMMENT ON COLUMN value (string or empty)
+
+SQLAlchemy's inspect() already retrieves these via get_table_comment() for
+the table and the "comment" key in get_columns() results for columns.
+No new dependencies are needed.
+
+### Semantic tag convention
+
+Column comments may contain a bracketed semantic tag anywhere in the text:
+  [semantic:time_series]
+  [semantic:metric]
+  [semantic:status]
+  [semantic:identifier]
+  [semantic:label]
+
+The extractor must parse this tag out of the comment text, store it
+separately as a "semantic" field on the column descriptor, and strip the
+tag from the human-readable comment text before it becomes the field
+description. If no tag is present, semantic is null.
+
+Valid semantic values: time_series, metric, status, identifier, label.
+Any unrecognised tag value is ignored (treated as null) with a warning logged.
+
+### Mapping into skill YAML
+
+  table_comment        → entity.business_description
+  column comment text  → field.description  (after tag stripped)
+  column semantic tag  → field.semantic
+
+If table_comment is empty, business_description is omitted from the
+generated YAML (do not write a TODO placeholder — omit the key entirely).
+If a column comment is empty, field.description is omitted.
+
+business_description and field.semantic are new optional fields on the
+EntitySkill and FieldDef Pydantic models. Both default to empty/null so
+all existing skill files remain valid with no changes.
+
+### LLM context enrichment
+
+The schema context string passed to the LLM (used in QuerySynthesiser and
+PatternSeeder) must be updated to include these new fields when present:
+
+  Current format:
+    Entity: Invoice (table: Invoice)
+    Fields: InvoiceId (integer PK), CustomerId (integer), Total (float)
+
+  Enriched format (when comments exist):
+    Entity: Invoice (table: Invoice)
+    Business context: Sales invoice raised when a customer completes a
+    purchase. Primary revenue record used for monthly reporting.
+    Fields:
+      InvoiceId (integer PK, identifier)
+      CustomerId (integer, identifier)
+      InvoiceDate (date, time_series) — Date purchase completed, used for trend analysis
+      Total (float, metric) — Total invoice value in USD, primary revenue metric
+
+Sensitive fields are always excluded regardless of comment content.
+This rule is pre-existing and must not be relaxed.
+
+---
+
+## FEATURE 2 — Role-based query context file
+
+### What to build
+
+A new optional CLI argument on the scaffold command:
+
+  dynamoui scaffold --adapter postgresql --schema public \
+    --output-dir ./skills/ \
+    --seed-patterns \
+    --context-file ./business_context.yaml
+
+The context file is a YAML file with this structure:
+
+  roles:
+    - name: Store Operator
+      entities: [Invoice, Customer]      # optional; omit to apply to all entities
+      queries:
+        - "last 5 purchases by a customer"
+        - "invoices from last month"
+        - "total revenue this month"
+        - "which customers have spent the most"
+    - name: Finance
+      entities: [Invoice]
+      queries:
+        - "monthly invoice summary for last 6 months"
+        - "revenue by country"
+        - "average order value this quarter"
+    - name: Music Buyer
+      entities: [Track, Album, Genre]
+      queries:
+        - "top genres by number of purchases"
+        - "best selling albums this year"
+        - "tracks never purchased"
+
+The entities list scopes which entities receive that role's queries in
+their patterns file and widgets. If entities is omitted, the role's
+queries are included for every entity.
+
+### How it feeds the LLM seeder
+
+When --context-file is provided, the PatternSeeder prompt for each entity
+is extended with a "Business use cases" section listing the queries from
+roles whose entities list includes that entity (or all roles if no scoping).
+
+  Example addition to the seeder prompt for Invoice:
+
+    Business use cases:
+    Store Operator asks:
+      - "last 5 purchases by a customer"
+      - "invoices from last month"
+      - "total revenue this month"
+      - "which customers have spent the most"
+    Finance asks:
+      - "monthly invoice summary for last 6 months"
+      - "revenue by country"
+      - "average order value this quarter"
+
+    Generate patterns that address these use cases directly. Each query
+    above should map to at least one pattern with that query (or a close
+    paraphrase) as a trigger.
+
+This means the typical_queries become first-class pattern triggers
+verbatim — not just hints. The LLM is explicitly instructed to cover them.
+
+### How it feeds widget generation
+
+Widgets generated from seeded patterns use:
+  - category: the role name from the context file whose query triggered the pattern
+  - title: the original query string from the context file (not the pattern id)
+
+If a pattern was not derived from a context file query (i.e. the LLM
+generated it independently), widget category falls back to the entity name
+and title is derived from the pattern description.
+
+The result is a widget list grouped by business role rather than by entity,
+which is what a business user dashboard should look like.
+
+### domain_roles in skill YAML
+
+After successful seeding, the scaffolder writes the role/query pairs that
+were used for that entity back into the skill YAML under domain_roles.
+This makes the context file's content part of the versioned skill definition
+and means future re-scaffolds or LLM synthesis calls have the role context
+available without needing the context file again.
+
+  domain_roles:
+    - role: Store Operator
+      typical_queries:
+        - "last 5 purchases by a customer"
+        - "invoices from last month"
+    - role: Finance
+      typical_queries:
+        - "monthly invoice summary for last 6 months"
+
+domain_roles is a new optional field on EntitySkill. Default: empty list.
+
+---
+
+## CONSTRAINTS
+
+1. Both features are additive. No existing skill YAML field is removed or
+   renamed. All new fields are optional with safe defaults.
+
+2. Sensitive field exclusion applies everywhere. Any code path that builds
+   an LLM prompt must check field.sensitive and skip those fields. This
+   includes the enriched schema context format introduced in Feature 1.
+
+3. Missing context file is not an error. If --context-file is not provided,
+   scaffolding proceeds with schema comments only (Feature 1 still applies).
+   If --context-file points to a non-existent file, the CLI exits with a
+   clear error message before any DB connection is made.
+
+4. Missing database comments are not an error. If a table has no COMMENT
+   ON TABLE, business_description is simply omitted. If a column has no
+   comment, description is omitted. The scaffolder must not fail or warn
+   loudly on absent comments — they are optional by design.
+
+5. Unrecognised semantic tag values are silently ignored (null semantic,
+   comment text preserved as-is, one debug log line).
+
+6. The context file is operator-supplied documentation, not executable
+   input. Its query strings are never executed or passed to the adapter.
+   They are only used as LLM prompt content and as pattern triggers in
+   the generated YAML.
+
+7. LLM calls during scaffold remain one call per entity. The context file
+   content is injected into the existing per-entity prompt, not as a
+   separate call.
+
+8. domain_roles written to skill YAML after seeding must be reviewed by
+   the operator before committing, consistent with all other scaffold
+   output. The SCAFFOLD_HEADER comment already communicates this.
+
+---
+
+## VERIFICATION
+
+  [ ] Table with COMMENT ON TABLE → business_description populated in
+      skill YAML, no TODO placeholder
+
+  [ ] Table without COMMENT ON TABLE → business_description key absent
+      from skill YAML entirely
+
+  [ ] Column comment "Total invoice value [semantic:metric]" →
+      field.description = "Total invoice value",
+      field.semantic = "metric"
+
+  [ ] Column comment with unrecognised tag "[semantic:revenue_kpi]" →
+      field.semantic = null, description = "Total invoice value [semantic:revenue_kpi]"
+      (tag preserved in description since it was not parsed), one debug log
+
+  [ ] dynamoui scaffold --seed-patterns --context-file business_context.yaml →
+      generated patterns for Invoice include at least one pattern with trigger
+      matching "invoices from last month" or close paraphrase
+
+  [ ] Generated widgets for Invoice have category "Store Operator" and
+      category "Finance" based on context file roles
+
+  [ ] dynamoui scaffold --seed-patterns (no context file) →
+      scaffolding completes normally using schema comments only
+
+  [ ] dynamoui scaffold --context-file missing.yaml →
+      CLI exits with clear error before DB connection
+
+  [ ] domain_roles written to Invoice.skill.yaml after seeding matches
+      the roles and queries from business_context.yaml scoped to Invoice
+
+  [ ] Sensitive fields absent from enriched schema context string in
+      all LLM prompt paths

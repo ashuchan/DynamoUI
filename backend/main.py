@@ -24,6 +24,7 @@ from backend.skill_registry.config.settings import (
     PatternCacheSettings,
     SkillRegistrySettings,
     configure_logging,
+    internal_settings,
     pg_settings,
     skill_settings,
     cache_settings,
@@ -72,6 +73,7 @@ def create_app(
 
 def _register_routers(app: FastAPI) -> None:
     from backend.adapters.api.rest_router import router as entities_router
+    from backend.metering.api.routes import router as metering_router
     from backend.pattern_cache.api.rest_router import router as patterns_router
     from backend.skill_registry.api.rest_router import router as skill_router
     from backend.skill_registry.api.widgets_router import router as widgets_router
@@ -81,6 +83,7 @@ def _register_routers(app: FastAPI) -> None:
     app.include_router(patterns_router, prefix=prefix, tags=["pattern-cache"])
     app.include_router(entities_router, prefix=prefix, tags=["entities"])
     app.include_router(widgets_router, prefix=prefix, tags=["widgets"])
+    app.include_router(metering_router, prefix=f"{prefix}/metering", tags=["metering"])
 
 
 # ---------------------------------------------------------------------------
@@ -169,7 +172,31 @@ async def _startup(app: FastAPI) -> None:
     from backend.adapters.registry import initialise_adapters
     await initialise_adapters(str(adapters_registry_path), pg_settings, skill_registry=registry)
 
-    # Step 7 — Build pattern cache
+    # Step 7 — Initialise metering subsystem
+    from backend.metering.models.tables import configure_schema
+    from backend.metering.service import create_metering_service
+    from backend.adapters.postgresql.engine import PostgreSQLEngine as _PGEngine
+
+    configure_schema(internal_settings.db_schema)
+
+    metering_service = None
+    try:
+        metering_db_url = internal_settings.resolved_db_url(pg_settings)
+        from sqlalchemy.ext.asyncio import create_async_engine as _create_engine
+        metering_engine = _create_engine(
+            metering_db_url,
+            pool_size=2,
+            max_overflow=3,
+            pool_recycle=3600,
+        )
+        metering_service = create_metering_service(metering_engine)
+        app.state.metering_service = metering_service
+        log.info("metering.initialised", schema=internal_settings.db_schema)
+    except Exception as exc:
+        log.warning("metering.init_failed", error=str(exc))
+        app.state.metering_service = None
+
+    # Step 9 — Build pattern cache
     from backend.pattern_cache.cache.pattern_cache import PatternCache
 
     pattern_cache = PatternCache(
@@ -183,13 +210,31 @@ async def _startup(app: FastAPI) -> None:
     )
     app.state.pattern_cache = pattern_cache
 
-    # Step 8 — Wire LLM provider, QuerySynthesiser, PatternPromoter
+    # Step 10 — Wire LLM provider, QuerySynthesiser, PatternPromoter
     from backend.skill_registry.config.settings import llm_settings
     from backend.skill_registry.llm.provider import create_provider
     from backend.skill_registry.llm.query_synthesiser import QuerySynthesiser
     from backend.pattern_cache.promotion.promoter import PatternPromoter
 
     llm_provider = create_provider(llm_settings)
+
+    # Wrap with metering decorator when metering is available
+    if metering_service is not None:
+        from backend.metering.provider_decorator import MeteringLLMProvider
+        provider_name = llm_settings.provider
+        model = (
+            llm_settings.anthropic_model
+            if provider_name == "anthropic"
+            else llm_settings.google_model
+        )
+        llm_provider = MeteringLLMProvider(
+            inner=llm_provider,
+            metering_service=metering_service,
+            provider_name=provider_name,
+            model=model,
+        )
+        log.info("metering.provider_wrapped", provider=provider_name, model=model)
+
     app.state.query_synthesiser = QuerySynthesiser(llm_provider)
 
     def _on_pattern_promoted(entity: str, path: Path) -> None:
@@ -239,6 +284,14 @@ async def _shutdown(app: FastAPI) -> None:
     for adapter in adapter_registry.values():
         if hasattr(adapter, "dispose"):
             await adapter.dispose()
+    # Dispose metering engine if it was created separately
+    metering_svc = getattr(app.state, "metering_service", None)
+    if metering_svc is not None:
+        try:
+            engine = metering_svc._ops._engine
+            await engine.dispose()
+        except Exception:
+            pass
     log.info("dynamoui.shutdown_complete")
 
 

@@ -1,0 +1,92 @@
+# business_context.yaml
+# Provide this file to dynamoui scaffold --context-file business_context.yaml
+# to seed business-meaningful patterns and widgets during scaffolding.
+#
+# Structure:
+#   roles: list of business personas and the natural language queries they ask
+#   Each role can optionally scope its queries to specific entities.
+#   If entities is omitted, the role's queries apply to all entities.
+#
+# Tips:
+#   - Write queries the way a real user would type them in the NL bar
+#   - Include time-based, ranking, and cross-entity queries — the LLM
+#     will figure out the joins; you just describe the business need
+#   - One role per real persona in your organisation
+#   - Queries do not need to be exhaustive — 5 to 10 per role is enough
+
+roles:
+
+  - name: Store Operator
+    description: >
+      Day-to-day store management. Monitors customer activity,
+      recent sales, and operational health.
+    entities: [Invoice, Customer, Employee]
+    queries:
+      - "last 5 purchases by a customer"
+      - "customers who bought something this week"
+      - "invoices from last month"
+      - "total revenue this month"
+      - "which customers have spent the most"
+      - "customers with no purchases in the last 90 days"
+      - "which employee handled the most customer accounts"
+      - "new customers added this month"
+
+  - name: Finance
+    description: >
+      Revenue reporting and period-over-period analysis.
+      Works with invoice totals, billing geography, and trends.
+    entities: [Invoice, InvoiceLine]
+    queries:
+      - "monthly invoice summary for the last 6 months"
+      - "total revenue by country"
+      - "average order value this quarter"
+      - "revenue trend over the last 12 months"
+      - "top 10 invoices by total value"
+      - "invoices with total above 20 dollars"
+      - "monthly revenue compared to previous month"
+      - "number of invoices per billing country"
+
+  - name: Music Catalogue Manager
+    description: >
+      Manages the music library. Interested in catalogue completeness,
+      artist and album coverage, and track-level metadata.
+    entities: [Artist, Album, Track, Genre, MediaType]
+    queries:
+      - "artists with no albums"
+      - "albums with no tracks"
+      - "tracks longer than 5 minutes"
+      - "tracks with no composer listed"
+      - "how many tracks are in each genre"
+      - "albums by a specific artist"
+      - "tracks available in each media type"
+      - "most common media type in the catalogue"
+
+  - name: Music Buyer
+    description: >
+      Analyses what customers are actually buying to inform
+      promotions, recommendations, and inventory decisions.
+    entities: [Track, Album, Artist, Genre, InvoiceLine, Invoice]
+    queries:
+      - "top 5 albums by number of purchases"
+      - "top 10 tracks purchased this month"
+      - "best selling genres overall"
+      - "artists whose tracks have never been purchased"
+      - "tracks purchased more than 50 times"
+      - "which genre generates the most revenue"
+      - "top selling albums by a specific artist"
+      - "customers who bought tracks from a specific genre"
+
+  - name: Customer Support
+    description: >
+      Handles customer queries and account lookups.
+      Needs fast access to purchase history and contact details.
+    entities: [Customer, Invoice, InvoiceLine, Track]
+    queries:
+      - "find customer by email"
+      - "all invoices for a specific customer"
+      - "last purchase made by a customer"
+      - "tracks a customer has purchased"
+      - "customers from a specific country"
+      - "customer contact details by name"
+      - "total amount spent by a customer"
+      - "customers with a support rep assigned"

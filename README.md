@@ -247,21 +247,164 @@ python -m uvicorn backend.main:app --host 0.0.0.0 --port 8001
 python -m backend.main
 ```
 
+## LLM Metering
+
+DynamoUI records every LLM call and the operation that triggered it. Metering data is written to a dedicated internal PostgreSQL schema (`dynamoui_internal`) that is completely separate from your application data.
+
+### What is tracked
+
+**Every operation** that may trigger an LLM call gets one row in `metering_operations`:
+
+| Operation type | When it fires |
+|---|---|
+| `resolve` | Each `POST /api/v1/resolve` call |
+| `scaffold_table` | Each `dynamoui scaffold --table` run (when `--seed-patterns` is set) |
+| `scaffold_schema` | Each LLM batch within `dynamoui scaffold --schema` (when `--seed-patterns` is set) |
+
+**Each actual LLM API call** within that operation gets one row in `metering_llm_interactions`, capturing:
+
+- Provider and model name
+- Prompt, completion, and thinking token counts
+- Cost in USD (calculated at write time using the active rate from `metering_cost_rates`)
+- Latency in milliseconds
+- First 500 characters of any thinking block (for auditors optimising prompts)
+- FK to the exact cost rate row used — historical costs are preserved even when rates change
+
+### Internal schema setup
+
+The metering tables live in the `dynamoui_internal` PostgreSQL schema. Create this schema and tables by running the Alembic migration:
+
+```bash
+# From the repo root
+alembic upgrade head
+```
+
+This creates the `dynamoui_internal` schema, all three tables, the required indexes, and seeds the initial cost rates for the configured default providers.
+
+> **Permissions required**: the write user (`dynamoui_writer`) must be able to create schemas and tables. The migration grants the necessary permissions automatically. If you are using a restricted write user, run the migration as a superuser or database owner once, then revoke the CREATE privilege afterwards.
+
+To check the current migration status:
+
+```bash
+alembic current
+alembic history
+```
+
+To roll back (drops all metering tables and the schema):
+
+```bash
+alembic downgrade base
+```
+
+### Configuration
+
+Metering is controlled by `DYNAMO_INTERNAL_*` environment variables. Add them to your `.env`:
+
+```env
+# PostgreSQL schema for all DynamoUI-managed tables (default shown)
+DYNAMO_INTERNAL_DB_SCHEMA=dynamoui_internal
+
+# Optional: separate DB URL for the internal schema.
+# Defaults to the write pool URL (same database, different schema).
+# DYNAMO_INTERNAL_DB_URL=postgresql+asyncpg://user:pass@host:5432/db
+```
+
+| Variable | Default | Description |
+|---|---|---|
+| `DYNAMO_INTERNAL_DB_SCHEMA` | `dynamoui_internal` | PostgreSQL schema name for metering tables |
+| `DYNAMO_INTERNAL_DB_URL` | _(uses write pool URL)_ | Override to point metering at a separate database |
+
+Metering is **best-effort** — if the metering database is unavailable at startup, the service starts in no-op mode (one warning logged, no further errors). If a write fails at runtime, it is logged at `WARN` level and swallowed; the original request is never affected.
+
+### Metering API
+
+Once the migration has run, the metering endpoints are available under `/api/v1/metering`:
+
+```
+GET  /api/v1/metering/summary               Totals: operations, cache hit rate, tokens, cost
+GET  /api/v1/metering/operations            Paginated operation list (?operation_type=resolve)
+GET  /api/v1/metering/operations/{id}       Single operation + its LLM interactions
+GET  /api/v1/metering/cost-by-model         Cost aggregated by provider + model
+GET  /api/v1/metering/cost-rates            Full history of cost rates (append-only ledger)
+POST /api/v1/metering/cost-rates            Add a new cost rate version
+```
+
+### Managing cost rates
+
+The `metering_cost_rates` table is an append-only ledger — rows are never updated or deleted. Each price change creates a new row and closes the previous one. Every interaction row stores a FK to the exact rate row used, so historical costs are never retroactively altered.
+
+To add a new rate when Anthropic or Google changes their pricing:
+
+```bash
+curl -X POST http://localhost:8001/api/v1/metering/cost-rates \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provider": "anthropic",
+    "model": "claude-haiku-4-5-20251001",
+    "input_cost_per_1k": "0.00080000",
+    "output_cost_per_1k": "0.00400000",
+    "thinking_cost_per_1k": "0.00080000",
+    "effective_from": "2026-05-01",
+    "change_reason": "Anthropic May 2026 pricing update",
+    "source_reference": "https://www.anthropic.com/pricing",
+    "created_by": "ops-team"
+  }'
+```
+
+`change_reason` and `created_by` are required and must be non-blank — the DAO enforces this as an audit requirement.
+
+### Schema DDL
+
+The canonical schema definition lives in `backend/metering/models/tables.py` (SQLAlchemy Core). A human-readable DDL file is derived from it:
+
+```bash
+python -m backend.metering.schema.export
+# Writes: backend/metering/schema/metering_schema.sql
+```
+
+Commit `metering_schema.sql` alongside any changes to `tables.py`. CI can detect drift by running the export and checking `git diff`.
+
+### Multi-tenancy path
+
+The schema is forward-compatible with multi-tenancy. All tables have a nullable `tenant_id UUID` column. When multi-tenancy is introduced:
+
+1. Add a `tenants` table (Alembic migration)
+2. Backfill `tenant_id` with a default tenant UUID
+3. Make `tenant_id` `NOT NULL` and add FK constraints
+4. Add PostgreSQL Row-Level Security (RLS) policies
+5. Wire `tenant_id` from JWT claims at the endpoint level
+
+No changes are needed to the metering service or DAOs — they already pass `tenant_id` through.
+
+---
+
 ## Architecture
 
 ```
 backend/
   adapters/               SQLAlchemy adapter layer (PostgreSQL)
     postgresql/           QueryTranslator — joins, aggregations, TOP N
+  metering/               LLM usage metering subsystem
+    models/               SQLAlchemy Core table definitions (canonical SDL)
+    dto/                  Pydantic DTOs — Create / Update / Read per entity
+    dao/                  Data Access Objects — all SQL lives here
+    api/                  GET /metering/* + POST /metering/cost-rates
+    schema/               DDL export script + committed metering_schema.sql
+    context.py            MeteringContext ContextVar (threading-free call chain)
+    cost.py               CostCalculator — Decimal-safe USD cost from token counts
+    provider_decorator.py MeteringLLMProvider — wraps any LLMProvider automatically
+    service.py            MeteringService — high-level API, all exceptions swallowed
   pattern_cache/          Fuzzy trigger matching, pattern caching, pattern promotion
     promotion/            PatternPromoter — auto-write or review-queue LLM patterns
   skill_registry/         Skill/enum YAML loading, validation, LLM formatting
     llm/                  LLM provider abstraction, QuerySynthesiser, PatternSeeder
     cli/                  Click CLI entry points
-    config/               Pydantic Settings (DYNAMO_PG_*, DYNAMO_SKILL_*, DYNAMO_CACHE_*, DYNAMO_LLM_*)
+    config/               Pydantic Settings (DYNAMO_PG_*, DYNAMO_SKILL_*, DYNAMO_CACHE_*, DYNAMO_LLM_*, DYNAMO_INTERNAL_*)
 skills/                   *.skill.yaml + *.patterns.yaml — entity definitions
 enums/                    *.enum.yaml — enum definitions
 pattern_reviews/          Candidate patterns awaiting operator review
+alembic/                  Database migrations (internal schema only)
+  versions/               Migration scripts — named YYYYMMDD_NNN_description.py
 tests/                    pytest test suite
 ```
 

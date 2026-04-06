@@ -182,6 +182,38 @@ class LLMSettings(BaseSettings):
     )
 
 
+class InternalSettings(BaseSettings):
+    """
+    DYNAMO_INTERNAL_* — configuration for DynamoUI-managed internal tables.
+    All metering tables live in a dedicated PostgreSQL schema (default: dynamoui_internal),
+    isolated from the business-data schemas managed by adapters.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="DYNAMO_INTERNAL_",
+        case_sensitive=False,
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    db_schema: str = Field(
+        "dynamoui_internal",
+        description="PostgreSQL schema for all DynamoUI-managed tables",
+    )
+    db_url: str = Field(
+        "",
+        description=(
+            "Full async SQLAlchemy URL for the internal schema. "
+            "Defaults to the pg_settings write URL when empty."
+        ),
+    )
+
+    def resolved_db_url(self, pg: "PostgreSQLSettings") -> str:
+        """Return the configured URL or fall back to the write pool URL."""
+        return self.db_url if self.db_url else pg.write_url
+
+
 # ---------------------------------------------------------------------------
 # Module-level singletons — constructed once at import time.
 # Tests can override by monkey-patching or using dependency injection.
@@ -190,6 +222,7 @@ skill_settings = SkillRegistrySettings()
 pg_settings = PostgreSQLSettings()
 cache_settings = PatternCacheSettings()
 llm_settings = LLMSettings()
+internal_settings = InternalSettings()
 
 
 def configure_logging(settings: SkillRegistrySettings = skill_settings) -> None:

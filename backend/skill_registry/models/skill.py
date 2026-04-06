@@ -80,6 +80,10 @@ class FieldDef(BaseModel):
     db_column_name: str = Field(
         "", description="Actual DB column name when it differs from name (e.g. PascalCase)"
     )
+    semantic: str | None = Field(
+        None,
+        description="Semantic tag from column comment: time_series|metric|status|identifier|label",
+    )
 
     model_config = {"populate_by_name": True}
 
@@ -137,6 +141,13 @@ class EntitySkill(BaseModel):
     schema_name: str = Field("public", description="PostgreSQL schema name")
     db_table_name: str = Field(
         "", description="Actual DB table name when it differs from table (e.g. PascalCase)"
+    )
+    business_description: str = Field(
+        "", description="Table-level business description from PostgreSQL COMMENT ON TABLE"
+    )
+    domain_roles: list[dict] = Field(
+        default_factory=list,
+        description="Business role context used during scaffold seeding (role + typical_queries)",
     )
 
     @field_validator("entity")
