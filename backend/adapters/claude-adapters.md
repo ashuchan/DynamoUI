@@ -1,7 +1,7 @@
 # claude-adapters
 
 Module: `backend/adapters/`
-Role: Abstract data query/mutation interface (`DataAdapter` ABC) + PostgreSQL implementation. DynamoUI reflects tables it does not own — SQLAlchemy Core only, never ORM.
+Role: Abstract data query/mutation interface (`DataAdapter` ABC) + PostgreSQL implementation + lazy-imported cloud adapters (Phase 5: DynamoDB, Spanner, Oracle, Cosmos DB). DynamoUI reflects tables it does not own — SQLAlchemy Core only, never ORM.
 
 ## Key Classes
 
@@ -25,6 +25,30 @@ Role: Abstract data query/mutation interface (`DataAdapter` ABC) + PostgreSQL im
 - `register_adapter(key, adapter)` — module-level dict singleton
 - `get_adapter(key)` → `DataAdapter`
 - `initialise_adapters()` — reads `adapters.registry.yaml`, creates and pools all adapters at startup
+
+### Cloud adapters (Phase 5)
+
+Shared scaffolding lives in `adapters/cloud_base.py` and `adapters/kinds.py`. Individual adapter packages implement a `ConnectionTester` (used by the admin `/connections/{id}/test` endpoint) and optionally a `Scaffolder` (used by `/connections/{id}/scaffold`).
+
+| File | Role |
+|---|---|
+| `cloud_base.py` | `CloudDataAdapter` base with `NotImplementedError` stubs for query/mutation. `lazy_import(module, install_hint)` helper that raises `CloudAdapterImportError` with the exact `pip install` line. |
+| `kinds.py` | Canonical adapter-kind identifiers (`POSTGRESQL`, `DYNAMODB`, `SPANNER`, `ORACLE`, `COSMOSDB`, …). Used by `tenant_db_connections.adapter_kind`, `ConnectionService.register_tester`, and `ScaffoldService.register_scaffolder`. |
+| `cloud_registry.py` | `register_cloud_adapters(connection_service, scaffold_service)` — the **single** file that wires every tester + scaffolder into startup. Adding a new kind only touches this file. |
+| `dynamodb/adapter.py` | `DynamoDBConnectionTester` takes an injectable `client_factory` (default: `boto3.client('dynamodb', ...)`) so unit tests don't need `boto3`. |
+| `dynamodb/scaffolder.py` | Inspects `list_tables` + `describe_table`; reflects `KeySchema` into draft skill YAML. Warns that item attributes need manual addition. |
+| `spanner/adapter.py` | `SpannerConnectionTester` verifies via `instance.list_databases()`. |
+| `oracle/adapter.py` | `OracleConnectionTester` runs `SELECT 1 FROM DUAL`; closes the connection on both success and failure. |
+| `cosmosdb/adapter.py` | `CosmosDBConnectionTester` verifies via `client.list_databases()`. |
+
+#### Adding a new cloud adapter
+
+1. Add the identifier constant to `backend/adapters/kinds.py`.
+2. Create `backend/adapters/<kind>/__init__.py` + `adapter.py`. Subclass `CloudDataAdapter`. Implement a `<Kind>ConnectionTester` class that accepts an injectable client factory.
+3. Add a default factory that uses `lazy_import("<sdk>", "pip install <sdk>")`.
+4. Register the tester (and optionally a scaffolder) in `backend/adapters/cloud_registry.register_cloud_adapters`.
+5. Add an `extras_require` entry in `pyproject.toml` — **never** add the SDK to runtime `dependencies`.
+6. Add a unit test in `tests/test_cloud_adapters.py` following the existing injected-fake pattern. **No network calls in CI.**
 
 ### PostgreSQL (`adapters/postgresql/`)
 

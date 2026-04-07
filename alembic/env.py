@@ -11,8 +11,22 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from backend.auth.models.tables import auth_metadata
+from backend.auth.models.tables import configure_schema as configure_auth_schema
 from backend.metering.models.tables import configure_schema, metering_metadata
 from backend.skill_registry.config.settings import internal_settings, pg_settings
+from backend.tenants.connections.tables import (
+    configure_schema as configure_connections_schema,
+    connections_metadata,
+)
+from backend.tenants.registry.tables import (
+    configure_schema as configure_registry_schema,
+    registry_metadata,
+)
+from backend.tenants.scaffold.tables import (
+    configure_schema as configure_scaffold_schema,
+    scaffold_metadata,
+)
 
 # ---------------------------------------------------------------------------
 # Alembic config object (alembic.ini)
@@ -25,7 +39,17 @@ if config.config_file_name is not None:
 # Bind schema and metadata
 # ---------------------------------------------------------------------------
 configure_schema(internal_settings.db_schema)
-target_metadata = metering_metadata
+configure_auth_schema(internal_settings.db_schema)
+configure_connections_schema(internal_settings.db_schema)
+configure_scaffold_schema(internal_settings.db_schema)
+configure_registry_schema(internal_settings.db_schema)
+target_metadata = [
+    metering_metadata,
+    auth_metadata,
+    connections_metadata,
+    scaffold_metadata,
+    registry_metadata,
+]
 
 DB_URL = internal_settings.resolved_db_url(pg_settings)
 

@@ -73,12 +73,20 @@ def create_app(
 
 def _register_routers(app: FastAPI) -> None:
     from backend.adapters.api.rest_router import router as entities_router
+    from backend.auth.api.routes import router as auth_router
     from backend.metering.api.routes import router as metering_router
     from backend.pattern_cache.api.rest_router import router as patterns_router
     from backend.skill_registry.api.rest_router import router as skill_router
     from backend.skill_registry.api.widgets_router import router as widgets_router
+    from backend.tenants.connections.routes import router as connections_router
+    from backend.tenants.registry.routes import router as registry_router
+    from backend.tenants.scaffold.routes import router as scaffold_router
 
     prefix = "/api/v1"
+    app.include_router(auth_router, prefix=prefix, tags=["auth"])
+    app.include_router(connections_router, prefix=prefix, tags=["admin-connections"])
+    app.include_router(scaffold_router, prefix=prefix, tags=["admin-scaffold"])
+    app.include_router(registry_router, prefix=prefix, tags=["admin-registry"])
     app.include_router(skill_router, prefix=prefix, tags=["skill-registry"])
     app.include_router(patterns_router, prefix=prefix, tags=["pattern-cache"])
     app.include_router(entities_router, prefix=prefix, tags=["entities"])
@@ -172,12 +180,26 @@ async def _startup(app: FastAPI) -> None:
     from backend.adapters.registry import initialise_adapters
     await initialise_adapters(str(adapters_registry_path), pg_settings, skill_registry=registry)
 
-    # Step 7 — Initialise metering subsystem
+    # Step 7 — Initialise metering + auth + connections subsystems
+    from backend.auth.models.tables import configure_schema as configure_auth_schema
     from backend.metering.models.tables import configure_schema
     from backend.metering.service import create_metering_service
     from backend.adapters.postgresql.engine import PostgreSQLEngine as _PGEngine
+    from backend.tenants.connections.tables import (
+        configure_schema as configure_connections_schema,
+    )
+    from backend.tenants.registry.tables import (
+        configure_schema as configure_registry_schema,
+    )
+    from backend.tenants.scaffold.tables import (
+        configure_schema as configure_scaffold_schema,
+    )
 
     configure_schema(internal_settings.db_schema)
+    configure_auth_schema(internal_settings.db_schema)
+    configure_connections_schema(internal_settings.db_schema)
+    configure_scaffold_schema(internal_settings.db_schema)
+    configure_registry_schema(internal_settings.db_schema)
 
     metering_service = None
     try:
@@ -195,6 +217,81 @@ async def _startup(app: FastAPI) -> None:
     except Exception as exc:
         log.warning("metering.init_failed", error=str(exc))
         app.state.metering_service = None
+
+    # Step 8 — Initialise auth subsystem (shares the internal pool when possible)
+    from backend.auth.config import auth_settings
+    from backend.auth.dao import AuthDAO
+    from backend.auth.service import AuthService
+
+    try:
+        auth_db_url = internal_settings.resolved_db_url(pg_settings)
+        from sqlalchemy.ext.asyncio import create_async_engine as _create_auth_engine
+
+        auth_engine = _create_auth_engine(
+            auth_db_url, pool_size=2, max_overflow=3, pool_recycle=3600
+        )
+        auth_dao = AuthDAO(auth_engine)
+        app.state.auth_dao = auth_dao
+        app.state.auth_engine = auth_engine
+        app.state.auth_service = AuthService(auth_dao, settings=auth_settings)
+        log.info("auth.initialised", schema=internal_settings.db_schema)
+
+        # Connections share the same engine — they live in the same schema.
+        from backend.tenants.connections.dao import ConnectionDAO
+        from backend.tenants.connections.service import ConnectionService
+        from backend.tenants.scaffold.dao import ScaffoldJobDAO
+        from backend.tenants.scaffold.service import ScaffoldService
+
+        connection_dao = ConnectionDAO(auth_engine)
+        connection_service = ConnectionService(connection_dao)
+        app.state.connection_dao = connection_dao
+        app.state.connection_service = connection_service
+
+        scaffold_dao = ScaffoldJobDAO(auth_engine)
+        app.state.scaffold_dao = scaffold_dao
+        app.state.scaffold_service = ScaffoldService(
+            dao=scaffold_dao, connection_service=connection_service
+        )
+
+        # Tenant YAML registry + LRU cache (Phase 4).
+        from backend.tenants.registry.cache import TenantRegistryCache
+        from backend.tenants.registry.config import tenant_registry_settings
+        from backend.tenants.registry.dao import RegistryDAO
+        from backend.tenants.registry.service import RegistryService
+
+        registry_dao = RegistryDAO(auth_engine)
+        registry_service = RegistryService(
+            dao=registry_dao,
+            cache=None,  # type: ignore[arg-type] — set below
+        )
+        registry_cache = TenantRegistryCache(
+            max_size=tenant_registry_settings.registry_cache_size,
+            loader=registry_service.build_view,
+        )
+        registry_service._cache = registry_cache  # noqa: SLF001
+        app.state.registry_dao = registry_dao
+        app.state.registry_cache = registry_cache
+        app.state.registry_service = registry_service
+
+        # Register Phase 5 cloud adapter testers + scaffolders.
+        from backend.adapters.cloud_registry import register_cloud_adapters
+
+        register_cloud_adapters(
+            connection_service=connection_service,
+            scaffold_service=app.state.scaffold_service,
+        )
+        log.info(
+            "connections.initialised",
+            registry_cache_size=tenant_registry_settings.registry_cache_size,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("auth.init_failed", error=str(exc))
+        app.state.auth_dao = None
+        app.state.auth_service = None
+        app.state.auth_engine = None
+        app.state.connection_service = None
+        app.state.scaffold_service = None
+        app.state.registry_service = None
 
     # Step 9 — Build pattern cache
     from backend.pattern_cache.cache.pattern_cache import PatternCache
@@ -290,6 +387,13 @@ async def _shutdown(app: FastAPI) -> None:
         try:
             engine = metering_svc._ops._engine
             await engine.dispose()
+        except Exception:
+            pass
+    # Dispose auth engine
+    auth_engine = getattr(app.state, "auth_engine", None)
+    if auth_engine is not None:
+        try:
+            await auth_engine.dispose()
         except Exception:
             pass
     log.info("dynamoui.shutdown_complete")
