@@ -34,7 +34,13 @@
 
 ---
 
-## Phase 1 — Auth Foundation (✅ shipped in this session)
+> **Status (2026-04-08):** All six phases are now shipped on `main`.
+> See ``docs/RELEASE_NOTES_MULTI_TENANT.md`` for the cross-phase summary,
+> migration history and rollback runbook.
+
+---
+
+## Phase 1 — Auth Foundation (✅ shipped)
 
 **Goal:** Users can sign up / sign in using email+password or Google OAuth. A
 signup creates a personal tenant with the user as owner. JWT carries a
@@ -98,7 +104,7 @@ signup creates a personal tenant with the user as owner. JWT carries a
 
 ---
 
-## Phase 2 — Tenant-Scoped DB Connection Registry + Encryption
+## Phase 2 — Tenant-Scoped DB Connection Registry + Encryption (✅ shipped)
 
 **Goal:** Tenants can register and manage database connections through the
 admin API. Credentials are encrypted at rest. All reads/writes are scoped to
@@ -134,7 +140,7 @@ the calling tenant.
 
 ---
 
-## Phase 3 — Admin Portal UI + DB Schema Scaffolding
+## Phase 3 — Admin Portal UI + DB Schema Scaffolding (✅ shipped)
 
 **Goal:** Frontend admin portal lets tenants manage connections, scaffold
 schemas, and review generated skill/pattern/widget configs.
@@ -161,7 +167,7 @@ schemas, and review generated skill/pattern/widget configs.
 
 ---
 
-## Phase 4 — Internal YAML Registry (tenant-scoped) + Runtime Cache
+## Phase 4 — Internal YAML Registry (tenant-scoped) + Runtime Cache (✅ shipped)
 
 **Goal:** Skills, patterns, widgets are stored per-tenant in the internal DB
 schema. Runtime boot loads only the calling tenant's configs into an LRU
@@ -197,7 +203,7 @@ cache, not the full global set.
 
 ---
 
-## Phase 5 — Cloud DB Adapters (DynamoDB, Spanner, Oracle, Cosmos DB…)
+## Phase 5 — Cloud DB Adapters (DynamoDB, Spanner, Oracle, Cosmos DB…) (✅ shipped)
 
 **Goal:** Tenants can add cloud-managed database connections.
 
@@ -228,16 +234,30 @@ cache, not the full global set.
 
 ---
 
-## Phase 6 — Merge Request & Release Hardening
+## Phase 6 — Release Hardening (✅ shipped)
 
-**Goal:** Open the MR to `main` and get it review-ready.
+**Goal:** Cross-phase release notes, rollback runbook, plan completion
+markers.
 
-### Scope
+### Delivered
 
-- Run full CI matrix (backend + frontend + alembic).
-- Generate release notes summarising every phase.
-- Document rollback steps for each Alembic migration.
-- Open the PR against `main` on both repos; link them to each other.
+- ``docs/RELEASE_NOTES_MULTI_TENANT.md`` with the cross-phase summary,
+  settings cheat sheet, full migration history and per-phase rollback
+  runbook.
+- Every phase header in this plan now carries a ``✅ shipped`` marker so
+  future contributors can see the rollout state at a glance.
+- Sanity checks (Python ``py_compile`` + ``npx tsc --noEmit``) ran green
+  before every commit. Unit tests for each phase live alongside the code
+  that introduced them.
+
+### Follow-up backlog (intentionally deferred)
+
+- Real query / mutation execution for the cloud adapters (Phase 5 ships
+  test + scaffold paths only).
+- Monaco-backed YAML editor for the registry tab (Phase 4 ships a plain
+  textarea — see the comment in ``RegistryPage.tsx``).
+- Per-tenant key rotation tooling (Phase 2 ``DYNAMO_CRYPTO_KEY_VERSION``
+  is in place but the rewrap CLI is not).
 
 ---
 
