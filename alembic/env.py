@@ -19,6 +19,10 @@ from backend.tenants.connections.tables import (
     configure_schema as configure_connections_schema,
     connections_metadata,
 )
+from backend.tenants.registry.tables import (
+    configure_schema as configure_registry_schema,
+    registry_metadata,
+)
 from backend.tenants.scaffold.tables import (
     configure_schema as configure_scaffold_schema,
     scaffold_metadata,
@@ -38,11 +42,13 @@ configure_schema(internal_settings.db_schema)
 configure_auth_schema(internal_settings.db_schema)
 configure_connections_schema(internal_settings.db_schema)
 configure_scaffold_schema(internal_settings.db_schema)
+configure_registry_schema(internal_settings.db_schema)
 target_metadata = [
     metering_metadata,
     auth_metadata,
     connections_metadata,
     scaffold_metadata,
+    registry_metadata,
 ]
 
 DB_URL = internal_settings.resolved_db_url(pg_settings)

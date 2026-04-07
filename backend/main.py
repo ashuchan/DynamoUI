@@ -79,12 +79,14 @@ def _register_routers(app: FastAPI) -> None:
     from backend.skill_registry.api.rest_router import router as skill_router
     from backend.skill_registry.api.widgets_router import router as widgets_router
     from backend.tenants.connections.routes import router as connections_router
+    from backend.tenants.registry.routes import router as registry_router
     from backend.tenants.scaffold.routes import router as scaffold_router
 
     prefix = "/api/v1"
     app.include_router(auth_router, prefix=prefix, tags=["auth"])
     app.include_router(connections_router, prefix=prefix, tags=["admin-connections"])
     app.include_router(scaffold_router, prefix=prefix, tags=["admin-scaffold"])
+    app.include_router(registry_router, prefix=prefix, tags=["admin-registry"])
     app.include_router(skill_router, prefix=prefix, tags=["skill-registry"])
     app.include_router(patterns_router, prefix=prefix, tags=["pattern-cache"])
     app.include_router(entities_router, prefix=prefix, tags=["entities"])
@@ -186,6 +188,9 @@ async def _startup(app: FastAPI) -> None:
     from backend.tenants.connections.tables import (
         configure_schema as configure_connections_schema,
     )
+    from backend.tenants.registry.tables import (
+        configure_schema as configure_registry_schema,
+    )
     from backend.tenants.scaffold.tables import (
         configure_schema as configure_scaffold_schema,
     )
@@ -194,6 +199,7 @@ async def _startup(app: FastAPI) -> None:
     configure_auth_schema(internal_settings.db_schema)
     configure_connections_schema(internal_settings.db_schema)
     configure_scaffold_schema(internal_settings.db_schema)
+    configure_registry_schema(internal_settings.db_schema)
 
     metering_service = None
     try:
@@ -246,7 +252,30 @@ async def _startup(app: FastAPI) -> None:
         app.state.scaffold_service = ScaffoldService(
             dao=scaffold_dao, connection_service=connection_service
         )
-        log.info("connections.initialised")
+
+        # Tenant YAML registry + LRU cache (Phase 4).
+        from backend.tenants.registry.cache import TenantRegistryCache
+        from backend.tenants.registry.config import tenant_registry_settings
+        from backend.tenants.registry.dao import RegistryDAO
+        from backend.tenants.registry.service import RegistryService
+
+        registry_dao = RegistryDAO(auth_engine)
+        registry_service = RegistryService(
+            dao=registry_dao,
+            cache=None,  # type: ignore[arg-type] — set below
+        )
+        registry_cache = TenantRegistryCache(
+            max_size=tenant_registry_settings.registry_cache_size,
+            loader=registry_service.build_view,
+        )
+        registry_service._cache = registry_cache  # noqa: SLF001
+        app.state.registry_dao = registry_dao
+        app.state.registry_cache = registry_cache
+        app.state.registry_service = registry_service
+        log.info(
+            "connections.initialised",
+            registry_cache_size=tenant_registry_settings.registry_cache_size,
+        )
     except Exception as exc:  # noqa: BLE001
         log.warning("auth.init_failed", error=str(exc))
         app.state.auth_dao = None
@@ -254,6 +283,7 @@ async def _startup(app: FastAPI) -> None:
         app.state.auth_engine = None
         app.state.connection_service = None
         app.state.scaffold_service = None
+        app.state.registry_service = None
 
     # Step 9 — Build pattern cache
     from backend.pattern_cache.cache.pattern_cache import PatternCache
