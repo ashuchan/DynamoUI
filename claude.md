@@ -2,6 +2,7 @@
 
 > Authoritative guide for Claude Code. Read fully before making any change.
 > Every rule here is derived directly from the LLD documents — do not deviate without flagging it.
+> Multi-tenant rollout status + phase-by-phase handoffs live in [`docs/MULTI_TENANT_PLAN.md`](docs/MULTI_TENANT_PLAN.md). Release notes + rollback runbook live in [`docs/RELEASE_NOTES_MULTI_TENANT.md`](docs/RELEASE_NOTES_MULTI_TENANT.md).
 
 ---
 
@@ -9,7 +10,9 @@
 
 **DynamoUI** is an Adaptive Data Interface Framework — a generic, LLM-powered system that generates interactive UIs for backend data models on demand. Teams onboard any data model by writing a skill YAML file and immediately get a fully functional, natural-language-driven UI with zero frontend code.
 
-**Current phase:** Phase 1 — Foundation (all 8 features scoped and designed)
+DynamoUI is **multi-tenant**: every sign-up creates a personal tenant, credentials are AES-GCM encrypted at rest, and runtime YAML configs are served per-tenant via a bounded LRU cache.
+
+**Current state:** Phase 6 of the multi-tenant rollout shipped. All six phases (auth, connection registry + encryption, admin portal + scaffold jobs, tenant YAML registry + LRU cache, cloud adapters, release hardening) are on `main`.
 
 ---
 
@@ -19,20 +22,41 @@ One backend service + one frontend application. No microservices, no gRPC betwee
 
 ```
 backend/
+  auth/               # Phase 1 — tenants, users, JWT, Google OAuth
+  crypto/             # Phase 2 — AES-GCM envelope encryption (single source of hazmat)
+  tenants/
+    connections/      # Phase 2 — tenant-scoped DB connection registry
+    scaffold/         # Phase 3 — async scaffold jobs
+    registry/         # Phase 4 — tenant YAML registry + bounded LRU runtime cache
   skill_registry/     # LLD 1, 2 — Skill + Enum registry, loader, validator, CLI
   pattern_cache/      # LLD 4 — Pattern cache, fuzzy matcher, trigger index
   adapters/           # LLD 3 — DataAdapter ABC, AdapterRegistry, PostgreSQLAdapter
+    cloud_base.py     # Phase 5 — CloudDataAdapter + lazy_import helper
+    cloud_registry.py # Phase 5 — register_cloud_adapters(...) called at startup
+    dynamodb/         # Phase 5 — boto3 tester + scaffolder
+    spanner/          # Phase 5 — google-cloud-spanner tester
+    oracle/           # Phase 5 — oracledb tester
+    cosmosdb/         # Phase 5 — azure-cosmos tester
+  metering/           # LLM usage metering subsystem
 frontend/
   src/
+    auth/             # Phase 1 — AuthContext, tokenStorage
+    components/auth/  # Phase 1 — AuthScreen, ProtectedRoute
+    admin/            # Phase 3/4 — AdminPortal, Connections, Scaffold, Registry pages
     components/       # LLD 6, 7, 8 — DataTable, DetailCard, Dashboard, theming
     lib/
       apiClient.ts    # Shared typed API client — the ONLY place fetch() is called
 skills/               # *.skill.yaml, *.enum.yaml, *.patterns.yaml, *.mutations.yaml
+                      # Phase 4: tenant-owned YAML lives in tenant_* DB tables, not on disk.
+                      # Platform defaults still live here and are merged per-tenant at lookup.
 widgets.yaml          # Widget dashboard definitions (LLD 8)
 adapters.registry.yaml
+docs/                 # MULTI_TENANT_PLAN.md + RELEASE_NOTES_MULTI_TENANT.md
+alembic/versions/     # 001_metering → 002_auth → 003_tenant_connections →
+                      # 004_scaffold_jobs → 005_tenant_registry
 ```
 
-> **Rule:** Never propose splitting into separate services for Phase 1. Flag any boundary-crossing refactor before proceeding.
+> **Rule:** Never propose splitting into separate services. Flag any boundary-crossing refactor before proceeding.
 
 ---
 
@@ -43,9 +67,11 @@ adapters.registry.yaml
 - **Framework:** FastAPI
 - **Validation:** Pydantic v2 — use `model_validator(mode='after')`, `field_validator`, `SettingsConfigDict`. Never use Pydantic v1 `@validator` or `class Config`.
 - **DB access:** SQLAlchemy 2.0 async Core (`sqlalchemy.ext.asyncio`) + `asyncpg`. **Not ORM.** DynamoUI reflects tables it does not own.
-- **Database (Phase 1):** PostgreSQL
+- **Database:** PostgreSQL for the internal schema (metering, auth, tenant registry). Cloud adapters (Phase 5): DynamoDB, Spanner, Oracle, Cosmos DB — all lazy-imported via `backend/adapters/cloud_base.lazy_import`.
+- **Auth:** `python-jose` JWTs + stdlib `hashlib.scrypt` for password hashing. **No `passlib`, no `bcrypt` dependency.** JWT claims: `sub` (user id), `tid` (tenant id), `email`, `role`, `iat`, `exp`. Use `get_current_tenant` / `require_role` dependencies — **never** read `tenant_id` from query strings or headers.
+- **Encryption:** AES-256-GCM envelope with per-record DEK wrapping via `backend/crypto/envelope.py`. `cryptography.hazmat` is imported **only** in that module — future phases must reuse `encrypt()` / `decrypt()` rather than re-importing.
 - **Fuzzy matching:** RapidFuzz `fuzz.token_sort_ratio` via `process.extractOne`. RapidFuzz scores are **0–100**, not 0–1. Divide by 100 when storing as `confidence`. Default hit threshold: **0.90** (i.e., `score_cutoff=90`).
-- **Pattern cache:** YAML files on disk, loaded at startup. Read-only in Phase 1.
+- **Pattern cache:** Platform default YAMLs on disk; tenant-owned YAMLs in `tenant_patterns` served via `TenantRegistryCache`.
 - **Logging:** `structlog`, JSON to stdout
 - **CLI:** Click (`dynamoui validate`, `dynamoui scaffold`, `dynamoui compile-patterns`)
 - **Settings:** Pydantic Settings with env prefixes (see below)
@@ -172,6 +198,33 @@ tests/
 ---
 
 ## Environment Variables
+
+### `DYNAMO_AUTH_*` — Auth subsystem (Phase 1)
+
+| Variable | Default | Notes |
+|---|---|---|
+| `DYNAMO_AUTH_JWT_SECRET` | dev placeholder | HS256 signing secret. **Required in prod.** |
+| `DYNAMO_AUTH_JWT_ALGORITHM` | `HS256` | |
+| `DYNAMO_AUTH_ACCESS_TOKEN_TTL_SECONDS` | `3600` | Access token lifetime |
+| `DYNAMO_AUTH_SIGNUP_ENABLED` | `true` | Disable to shut off public signups |
+| `DYNAMO_AUTH_GOOGLE_CLIENT_ID` | — | Empty disables Google login |
+| `DYNAMO_AUTH_GOOGLE_TOKENINFO_URL` | `https://oauth2.googleapis.com/tokeninfo` | Overridden in tests |
+| `DYNAMO_AUTH_SCRYPT_N` | `16384` | Password hashing CPU/memory cost |
+| `DYNAMO_AUTH_SCRYPT_R` | `8` | Block size |
+| `DYNAMO_AUTH_SCRYPT_P` | `1` | Parallelisation |
+
+### `DYNAMO_CRYPTO_*` — Envelope encryption (Phase 2)
+
+| Variable | Default | Notes |
+|---|---|---|
+| `DYNAMO_CRYPTO_MASTER_KEY` | — | Base64-encoded 32 bytes. **Required** for admin connection features. Generate via `python -c "from backend.crypto.envelope import generate_master_key; print(generate_master_key())"`. |
+| `DYNAMO_CRYPTO_KEY_VERSION` | `1` | Bump on rotation; older versions stay decryptable via the envelope `v` field. |
+
+### `DYNAMO_TENANT_*` — Tenant registry LRU cache (Phase 4)
+
+| Variable | Default | Notes |
+|---|---|---|
+| `DYNAMO_TENANT_REGISTRY_CACHE_SIZE` | `64` | Strict LRU bound on `TenantRegistryView` instances. Eviction is by least-recently-accessed. Tested under 500-tenant churn. |
 
 ### `DYNAMO_SKILL_*` — Skill Registry
 
@@ -513,6 +566,38 @@ export const apiClient = {
 
 ## REST API Reference
 
+### Auth (Phase 1)
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/v1/auth/signup` | Email + password signup. Creates a personal tenant + owner membership. |
+| `POST` | `/api/v1/auth/login` | Email + password login. |
+| `POST` | `/api/v1/auth/google` | Verify a Google ID token. Aud is checked in-process. |
+| `GET` | `/api/v1/auth/me` | Current user + active tenant + all memberships. Requires bearer token. |
+
+### Admin portal (Phases 2–4)
+
+Every `/api/v1/admin/*` route requires an authenticated `owner` or `admin` role via `require_role("owner", "admin")`. Reads on `/admin/registry/*` are also open to `member`.
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/v1/admin/connections` | List this tenant's connections |
+| `POST` | `/api/v1/admin/connections` | Register a new connection (password encrypted before insert) |
+| `GET` | `/api/v1/admin/connections/{id}` | |
+| `PATCH` | `/api/v1/admin/connections/{id}` | |
+| `DELETE` | `/api/v1/admin/connections/{id}` | |
+| `POST` | `/api/v1/admin/connections/{id}/test` | Run the adapter-specific connectivity tester |
+| `POST` | `/api/v1/admin/connections/{id}/scaffold` | Queue a schema inspection job (BackgroundTasks) |
+| `GET` | `/api/v1/admin/scaffold-jobs` | List this tenant's jobs |
+| `GET` | `/api/v1/admin/scaffold-jobs/{id}` | Poll status + progress + result summary |
+| `GET` | `/api/v1/admin/registry/types` | Supported registry resource types |
+| `GET` | `/api/v1/admin/registry/{type}` | List entries for the calling tenant |
+| `GET` | `/api/v1/admin/registry/{type}/{name}` | Read YAML source + parsed JSON |
+| `PUT` | `/api/v1/admin/registry/{type}/{name}` | Upsert — parses YAML, computes checksum, invalidates LRU |
+| `DELETE` | `/api/v1/admin/registry/{type}/{name}` | Delete + invalidate LRU |
+
+### Core (LLD 1–8)
+
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/api/v1/resolve` | Classify NL input + return QueryPlan |
@@ -551,12 +636,22 @@ DynamoUI manages a small set of framework-owned tables in a separate `dynamoui` 
 ## Architectural Rules
 
 ### Security — Non-Negotiable
-- **Never store DB credentials in YAML.** Only environment variables or secrets manager.
+- **Never store DB credentials in YAML.** For the bundled PG adapter use environment variables. For tenant-owned connections, the password MUST go through `backend.crypto.envelope.encrypt()` before hitting the database. The service layer (`ConnectionService`) enforces this — never call the DAO directly with a plaintext password.
+- **Crypto single point of truth:** `cryptography.hazmat` is imported **only** in `backend/crypto/envelope.py`. Future adapters / subsystems reuse `encrypt()` / `decrypt()`; they don't re-import the library.
+- **Never return plaintext credentials in a response DTO.** `ConnectionRead` exposes only `has_password: bool`. The decrypted dict produced by `ConnectionService.materialise(row)` is single-use — pass it straight to the adapter tester, never log it, never serialise it.
 - `sensitive: true` fields: excluded from LLM context injection, masked as `***` in all logs. They ARE returned in query results to authorised users.
 - `dynamoui_reader` for all queries. `dynamoui_writer` for mutations only. LLM never has access to either credential.
 - Raw user input is **never logged** — log only SHA-256 hash for correlation.
 - All queries built via SQLAlchemy Core's parameterised builders. **No string concatenation in query construction.**
 - `ssl_mode='require'` in production.
+
+### Multi-tenant invariants — Non-Negotiable
+- **Tenant segregation at the DAO layer.** Every method on `AuthDAO`, `ConnectionDAO`, `ScaffoldJobDAO`, `RegistryDAO` takes `tenant_id` as an **explicit argument** and applies it as a WHERE clause. There is no ambient request context — the `dependencies` module is the ONLY place the JWT is decoded.
+- **Cross-tenant access is a hard error.** Every new tenant-scoped DAO/service method MUST have a test that proves Tenant B can't read/update/delete Tenant A's rows. See `tests/test_tenant_connections.py`, `tests/test_tenant_scaffold.py`, `tests/test_tenant_registry_service.py` for the patterns to copy.
+- **Token tenant is re-verified on every request.** `get_current_context` looks up the membership in `auth_tenant_users` after decoding the JWT. Do not cache this check — a revoked role must take effect immediately.
+- **Tenant YAML registry mutations ALWAYS invalidate the LRU cache.** `RegistryService.upsert` / `delete` call `cache.invalidate(tenant_id)` before returning. Never skip this.
+- **Bounded memory.** The registry cache is strictly LRU with `DYNAMO_TENANT_REGISTRY_CACHE_SIZE` as the hard cap. Do not introduce any other global dict keyed on `tenant_id` — use the same cache or extend it.
+- **Roles live in `auth_tenant_users.role`.** Valid values: `owner`, `admin`, `member`, `viewer`. Do not invent a parallel authorisation scheme; use `require_role(...)` dependencies.
 
 ### Pattern Cache Rules
 - `dynamoui compile-patterns` must run in CI on every skill file change.
@@ -652,22 +747,28 @@ docker run \
 
 ---
 
-## What's Out of Scope (Phase 1)
+## What's Out of Scope (current release)
 
 Do not implement or propose:
 
-- MongoDB adapter (Phase 2)
-- REST/GraphQL adapters (Phase 2+)
-- Slack/Webhook notification channels (Phase 2, feature-flagged off)
-- Pattern promotion write-back from LLM (Phase 2 — `PatternPromoter` is a stub)
-- Redis-backed pattern cache (Phase 4)
-- Multi-tenant data isolation (Phase 2)
-- Hot-reload / inotify watch mode for skill files (Phase 2)
-- Per-user widget personalisation / drag-and-drop dashboard (Phase 2)
-- Visual diff preview modal upgrade (Phase 4 — v1 uses plain-text table)
-- Embedding-based semantic matching (Phase 3/4)
+- MongoDB adapter
+- REST/GraphQL adapters
+- Slack/Webhook notification channels (feature-flagged off)
+- Redis-backed pattern cache
+- Hot-reload / inotify watch mode for skill files
+- Per-user widget personalisation / drag-and-drop dashboard
+- Visual diff preview modal upgrade (v1 uses plain-text table)
+- Embedding-based semantic matching
 - Full WYSIWYG layout editor
 - Self-hosted LLM inference
-- Virtual scrolling for large result sets (v2)
-- Custom column renderers per entity (v2)
-- Export functionality (Phase 4)
+- Virtual scrolling for large result sets
+- Custom column renderers per entity
+- Export functionality
+
+### Intentionally deferred multi-tenant follow-ups
+
+Documented in Phase 6 of [`docs/MULTI_TENANT_PLAN.md`](docs/MULTI_TENANT_PLAN.md):
+
+- Real query / mutation execution for the cloud adapters (Phase 5 ships test + scaffold paths only; query stubs raise `NotImplementedError`).
+- Monaco-backed YAML editor for the admin registry tab (currently a plain textarea to keep the admin bundle lean).
+- Per-tenant key rotation CLI (`DYNAMO_CRYPTO_KEY_VERSION` is in place but the rewrap tool isn't).

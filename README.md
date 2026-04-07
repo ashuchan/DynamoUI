@@ -2,10 +2,15 @@
 
 LLM-powered UI generation for backend data models. Define your database schema as YAML skill files — DynamoUI serves query, filter, and mutation interfaces with no frontend code required.
 
+DynamoUI is **multi-tenant**: every user gets a personal tenant on sign-up, connects their own databases via an encrypted connection registry, scaffolds skills on demand, and edits YAML configs through an admin portal. See [`docs/MULTI_TENANT_PLAN.md`](docs/MULTI_TENANT_PLAN.md) and [`docs/RELEASE_NOTES_MULTI_TENANT.md`](docs/RELEASE_NOTES_MULTI_TENANT.md) for the full rollout, migration history, and rollback runbook.
+
 ## Tech Stack
 
 - **Python 3.11+** — FastAPI, Pydantic v2, SQLAlchemy 2, asyncpg
-- **PostgreSQL** — primary adapter (read/write user separation)
+- **PostgreSQL** — internal schema (auth, metering, tenant registry) + default business-data adapter
+- **Cloud adapters** (opt-in) — DynamoDB, Spanner, Oracle, Cosmos DB
+- **Auth** — email+password (stdlib scrypt) + Google OAuth → per-tenant JWTs (`python-jose`)
+- **Encryption** — AES-256-GCM envelope with per-record DEK wrapping (`cryptography`)
 - **Claude / Gemini** — LLM-driven query synthesis and pattern seeding
 
 ## Setup
@@ -66,6 +71,114 @@ Key variables:
 | `DYNAMO_PG_SSL_MODE` | `prefer` | Use `require` in production |
 
 Real environment variables always take precedence over `.env`. See `.env.example` for the full list including pool sizing and cache settings.
+
+## Configuring auth + encryption
+
+Authentication, the tenant connection registry, and the tenant YAML registry all live in the `dynamoui_internal` schema. Apply the Alembic migrations first (see [Internal schema setup](#internal-schema-setup)), then set the auth + crypto env vars.
+
+### Auth (`DYNAMO_AUTH_*`)
+
+| Variable | Default | Description |
+|---|---|---|
+| `DYNAMO_AUTH_JWT_SECRET` | dev placeholder | HS256 signing secret for access tokens. **Required in production.** |
+| `DYNAMO_AUTH_JWT_ALGORITHM` | `HS256` | JWT signing algorithm |
+| `DYNAMO_AUTH_ACCESS_TOKEN_TTL_SECONDS` | `3600` | Access token lifetime (default 1h) |
+| `DYNAMO_AUTH_SIGNUP_ENABLED` | `true` | Toggle public signups on/off |
+| `DYNAMO_AUTH_GOOGLE_CLIENT_ID` | _(empty)_ | Google OAuth client id. Empty disables Google login. |
+| `DYNAMO_AUTH_SCRYPT_N` | `16384` | Password hashing CPU/memory cost |
+
+JWTs carry `sub` (user id), `tid` (active tenant id), `email`, `role`, `iat`, `exp`. Routes protect themselves with the `current_tenant` / `require_role` FastAPI dependencies — the tenant claim is **re-verified against `auth_tenant_users` on every request** so a revoked membership takes effect immediately.
+
+### Crypto (`DYNAMO_CRYPTO_*`)
+
+Connection passwords and other secrets are encrypted at rest via AES-256-GCM with per-record DEK wrapping. Generate a master key once:
+
+```bash
+python -c "from backend.crypto.envelope import generate_master_key; print(generate_master_key())"
+```
+
+| Variable | Default | Description |
+|---|---|---|
+| `DYNAMO_CRYPTO_MASTER_KEY` | _(empty)_ | Base64-encoded 32 bytes. **Required for admin connection features.** |
+| `DYNAMO_CRYPTO_KEY_VERSION` | `1` | Bump when rotating to a new master key |
+
+### Tenant registry cache (`DYNAMO_TENANT_*`)
+
+| Variable | Default | Description |
+|---|---|---|
+| `DYNAMO_TENANT_REGISTRY_CACHE_SIZE` | `64` | Max `TenantRegistryView` instances kept in memory (LRU by `tenant_id`) |
+
+The cache is strictly bounded — eviction is least-recently-accessed, verified under 500-tenant churn in `tests/test_tenant_registry_cache.py`.
+
+## Auth endpoints (`/api/v1/auth`)
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/auth/signup` | Email + password signup. Creates a personal tenant with the user as owner. |
+| `POST` | `/auth/login` | Email + password login. Returns a new access token. |
+| `POST` | `/auth/google` | Verify a Google ID token → existing or new user + token. |
+| `GET` | `/auth/me` | Current user, active tenant, all memberships. |
+
+## Admin portal endpoints
+
+All admin endpoints require an authenticated `owner` or `admin` role on the calling tenant — enforced via `require_role("owner", "admin")`. Reads on `/admin/registry/*` are also open to `member`.
+
+### Database connections (`/api/v1/admin/connections`)
+
+```
+GET    /admin/connections              List this tenant's connections
+POST   /admin/connections              Register a new connection (password encrypted before insert)
+GET    /admin/connections/{id}
+PATCH  /admin/connections/{id}
+DELETE /admin/connections/{id}
+POST   /admin/connections/{id}/test    Run the adapter-specific connectivity tester
+```
+
+Response DTOs **never** include plaintext passwords — only `has_password: bool`. Plaintext is materialised once inside the service layer and passed straight to the adapter tester — it never crosses a request handler boundary.
+
+### Scaffold jobs (`/api/v1/admin/scaffold-jobs`)
+
+```
+POST /admin/connections/{id}/scaffold   Queue a schema inspection (runs in BackgroundTasks)
+GET  /admin/scaffold-jobs                List jobs for the calling tenant
+GET  /admin/scaffold-jobs/{job_id}       Poll status + progress + result summary
+```
+
+Adapter-specific scaffolders register via `ScaffoldService.register_scaffolder(kind, ...)`. The DynamoDB scaffolder ships in Phase 5; new kinds drop in without touching the orchestration.
+
+### Tenant YAML registry (`/api/v1/admin/registry`)
+
+```
+GET    /admin/registry/types              Supported resource types (skill / enum / pattern / widget)
+GET    /admin/registry/{type}              List entries for the calling tenant
+GET    /admin/registry/{type}/{name}       Read YAML source + parsed JSON
+PUT    /admin/registry/{type}/{name}       Upsert — parses YAML, computes checksum, invalidates LRU
+DELETE /admin/registry/{type}/{name}       Delete + invalidate LRU
+```
+
+Stored in `tenant_skills`, `tenant_enums`, `tenant_patterns`, `tenant_widgets`. YAML is parsed once on write and the parsed JSON lives in `parsed_json` so runtime lookups never pay re-parsing cost.
+
+## Cloud adapters (Phase 5)
+
+DynamoUI ships lazy-imported cloud adapters for:
+
+| Kind | SDK | `pip install` extra |
+|---|---|---|
+| `dynamodb` | `boto3` | `dynamoui[dynamodb]` |
+| `spanner` | `google-cloud-spanner` | `dynamoui[spanner]` |
+| `oracle` | `oracledb` | `dynamoui[oracle]` |
+| `cosmosdb` | `azure-cosmos` | `dynamoui[cosmosdb]` |
+| `bigquery` | `google-cloud-bigquery` | `dynamoui[bigquery]` |
+| `redshift` | `redshift-connector` | `dynamoui[redshift]` |
+| `snowflake` | `snowflake-connector-python` | `dynamoui[snowflake]` |
+
+Each adapter registers a `ConnectionTester` (used by the admin `test` endpoint) and optionally a `Scaffolder`. Wiring lives in [`backend/adapters/cloud_registry.py`](backend/adapters/cloud_registry.py) — adding a new kind only touches that file.
+
+Phase 5 ships the **connection-test** and **scaffold** paths; full query / mutation execution stubs raise `NotImplementedError` so callers can't get silent empty results. Install only the extras you actually use:
+
+```bash
+pip install -e ".[dev,dynamodb,spanner]"
+```
 
 ## Configuring the LLM provider
 
@@ -272,14 +385,24 @@ DynamoUI records every LLM call and the operation that triggered it. Metering da
 
 ### Internal schema setup
 
-The metering tables live in the `dynamoui_internal` PostgreSQL schema. Create this schema and tables by running the Alembic migration:
+All DynamoUI-owned tables live in the `dynamoui_internal` PostgreSQL schema — metering, auth, tenant DB connections, scaffold jobs, and the tenant YAML registry. Create everything in one shot:
 
 ```bash
 # From the repo root
 alembic upgrade head
 ```
 
-This creates the `dynamoui_internal` schema, all three tables, the required indexes, and seeds the initial cost rates for the configured default providers.
+| Revision | Tables |
+|---|---|
+| `001_metering` | `metering_cost_rates`, `metering_operations`, `metering_llm_interactions` |
+| `002_auth` | `auth_tenants`, `auth_users`, `auth_tenant_users`, `auth_oauth_identities` |
+| `003_tenant_connections` | `tenant_db_connections` (encrypted secrets) |
+| `004_scaffold_jobs` | `tenant_scaffold_jobs` |
+| `005_tenant_registry` | `tenant_skills`, `tenant_enums`, `tenant_patterns`, `tenant_widgets` |
+
+Per-phase rollback instructions live in [`docs/RELEASE_NOTES_MULTI_TENANT.md`](docs/RELEASE_NOTES_MULTI_TENANT.md). Every migration ships an idempotent `downgrade()`; always take a fresh logical backup of `dynamoui_internal` before rolling back across the auth chain because the FKs cascade.
+
+The initial metering migration also seeds cost rates for the configured default providers.
 
 > **Permissions required**: the write user (`dynamoui_writer`) must be able to create schemas and tables. The migration grants the necessary permissions automatically. If you are using a restricted write user, run the migration as a superuser or database owner once, then revoke the CREATE privilege afterwards.
 
@@ -364,17 +487,16 @@ python -m backend.metering.schema.export
 
 Commit `metering_schema.sql` alongside any changes to `tables.py`. CI can detect drift by running the export and checking `git diff`.
 
-### Multi-tenancy path
+### Multi-tenancy
 
-The schema is forward-compatible with multi-tenancy. All tables have a nullable `tenant_id UUID` column. When multi-tenancy is introduced:
+Multi-tenancy shipped across Phases 1–6 (see [`docs/MULTI_TENANT_PLAN.md`](docs/MULTI_TENANT_PLAN.md)):
 
-1. Add a `tenants` table (Alembic migration)
-2. Backfill `tenant_id` with a default tenant UUID
-3. Make `tenant_id` `NOT NULL` and add FK constraints
-4. Add PostgreSQL Row-Level Security (RLS) policies
-5. Wire `tenant_id` from JWT claims at the endpoint level
-
-No changes are needed to the metering service or DAOs — they already pass `tenant_id` through.
+* Every sign-up creates a personal tenant with the user as `owner`. The N:M `auth_tenant_users` table supports additional members in the same tenant (the frontend switcher hook is trivial to add).
+* `tenant_id` is carried in the JWT `tid` claim and re-verified against `auth_tenant_users` on every request.
+* Every tenant-scoped DAO takes `tenant_id` as an explicit argument — cross-tenant access is impossible by construction and covered by unit tests in `test_tenant_connections.py`, `test_tenant_scaffold.py`, and `test_tenant_registry_service.py`.
+* DB connection credentials are AES-256-GCM envelope-encrypted via `backend/crypto/envelope.py`. Plaintext never reaches the database or any response DTO.
+* Tenant YAML configs are stored in `tenant_{skills,enums,patterns,widgets}` and served at runtime via a bounded LRU cache (`DYNAMO_TENANT_REGISTRY_CACHE_SIZE`, default 64).
+* The metering tables already had `tenant_id` columns — they now receive the real tenant id from the auth subsystem rather than NULL.
 
 ---
 
@@ -382,8 +504,38 @@ No changes are needed to the metering service or DAOs — they already pass `ten
 
 ```
 backend/
-  adapters/               SQLAlchemy adapter layer (PostgreSQL)
+  auth/                   Phase 1 — tenants, users, JWT, Google OAuth
+    models/tables.py      auth_tenants, auth_users, auth_tenant_users, auth_oauth_identities
+    security.py           scrypt password hashing + python-jose JWT helpers
+    dao.py                AuthDAO — tenant-segregated lookups + signup transaction
+    service.py            AuthService — signup / login / google_login (injectable verifier)
+    api/routes.py         /api/v1/auth/{signup,login,google,me}
+    api/dependencies.py   get_current_user / get_current_tenant / require_role
+  crypto/                 Phase 2 — AES-256-GCM envelope with per-record DEK wrapping
+    envelope.py           encrypt() / decrypt() — ONLY place cryptography.hazmat is imported
+  tenants/
+    connections/          Phase 2 — tenant-scoped DB connection registry (encrypted secrets)
+      tables.py           tenant_db_connections
+      service.py          ConnectionService — tester registry, materialise() for adapters
+      routes.py           /api/v1/admin/connections/*
+    scaffold/             Phase 3 — async schema-inspection jobs
+      tables.py           tenant_scaffold_jobs
+      service.py          ScaffoldService — Scaffolder protocol + BackgroundTasks runner
+      routes.py           /api/v1/admin/connections/{id}/scaffold + /admin/scaffold-jobs
+    registry/             Phase 4 — tenant YAML registry + bounded LRU runtime cache
+      tables.py           tenant_skills, tenant_enums, tenant_patterns, tenant_widgets
+      cache.py            TenantRegistryCache — strict LRU keyed on tenant_id
+      service.py          RegistryService — parse-once-on-write, invalidate on mutation
+      routes.py           /api/v1/admin/registry/*
+  adapters/               SQLAlchemy adapter layer + cloud adapters (Phase 5)
     postgresql/           QueryTranslator — joins, aggregations, TOP N
+    cloud_base.py         CloudDataAdapter + lazy_import helper
+    cloud_registry.py     register_cloud_adapters() — single place to wire new kinds
+    kinds.py              Canonical adapter-kind identifiers (POSTGRESQL, DYNAMODB, …)
+    dynamodb/             boto3 — tester + scaffolder
+    spanner/              google-cloud-spanner — tester
+    oracle/               oracledb — tester
+    cosmosdb/             azure-cosmos — tester
   metering/               LLM usage metering subsystem
     models/               SQLAlchemy Core table definitions (canonical SDL)
     dto/                  Pydantic DTOs — Create / Update / Read per entity
@@ -399,13 +551,19 @@ backend/
   skill_registry/         Skill/enum YAML loading, validation, LLM formatting
     llm/                  LLM provider abstraction, QuerySynthesiser, PatternSeeder
     cli/                  Click CLI entry points
-    config/               Pydantic Settings (DYNAMO_PG_*, DYNAMO_SKILL_*, DYNAMO_CACHE_*, DYNAMO_LLM_*, DYNAMO_INTERNAL_*)
-skills/                   *.skill.yaml + *.patterns.yaml — entity definitions
-enums/                    *.enum.yaml — enum definitions
+    config/               Pydantic Settings (DYNAMO_PG_*, DYNAMO_SKILL_*, DYNAMO_CACHE_*,
+                          DYNAMO_LLM_*, DYNAMO_INTERNAL_*, DYNAMO_AUTH_*, DYNAMO_CRYPTO_*,
+                          DYNAMO_TENANT_*)
+skills/                   *.skill.yaml + *.patterns.yaml — platform default definitions
+                          (tenant-specific YAML lives in the tenant_* tables)
+enums/                    *.enum.yaml — platform default enums
 pattern_reviews/          Candidate patterns awaiting operator review
 alembic/                  Database migrations (internal schema only)
-  versions/               Migration scripts — named YYYYMMDD_NNN_description.py
-tests/                    pytest test suite
+  versions/               001_metering → 002_auth → 003_tenant_connections →
+                          004_scaffold_jobs → 005_tenant_registry
+docs/                     MULTI_TENANT_PLAN.md, RELEASE_NOTES_MULTI_TENANT.md
+tests/                    pytest test suite — in-memory fakes for auth / crypto /
+                          connections / scaffold / registry / cloud adapters
 ```
 
 ## License
