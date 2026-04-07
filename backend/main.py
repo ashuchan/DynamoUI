@@ -79,10 +79,12 @@ def _register_routers(app: FastAPI) -> None:
     from backend.skill_registry.api.rest_router import router as skill_router
     from backend.skill_registry.api.widgets_router import router as widgets_router
     from backend.tenants.connections.routes import router as connections_router
+    from backend.tenants.scaffold.routes import router as scaffold_router
 
     prefix = "/api/v1"
     app.include_router(auth_router, prefix=prefix, tags=["auth"])
     app.include_router(connections_router, prefix=prefix, tags=["admin-connections"])
+    app.include_router(scaffold_router, prefix=prefix, tags=["admin-scaffold"])
     app.include_router(skill_router, prefix=prefix, tags=["skill-registry"])
     app.include_router(patterns_router, prefix=prefix, tags=["pattern-cache"])
     app.include_router(entities_router, prefix=prefix, tags=["entities"])
@@ -184,10 +186,14 @@ async def _startup(app: FastAPI) -> None:
     from backend.tenants.connections.tables import (
         configure_schema as configure_connections_schema,
     )
+    from backend.tenants.scaffold.tables import (
+        configure_schema as configure_scaffold_schema,
+    )
 
     configure_schema(internal_settings.db_schema)
     configure_auth_schema(internal_settings.db_schema)
     configure_connections_schema(internal_settings.db_schema)
+    configure_scaffold_schema(internal_settings.db_schema)
 
     metering_service = None
     try:
@@ -227,10 +233,19 @@ async def _startup(app: FastAPI) -> None:
         # Connections share the same engine — they live in the same schema.
         from backend.tenants.connections.dao import ConnectionDAO
         from backend.tenants.connections.service import ConnectionService
+        from backend.tenants.scaffold.dao import ScaffoldJobDAO
+        from backend.tenants.scaffold.service import ScaffoldService
 
         connection_dao = ConnectionDAO(auth_engine)
+        connection_service = ConnectionService(connection_dao)
         app.state.connection_dao = connection_dao
-        app.state.connection_service = ConnectionService(connection_dao)
+        app.state.connection_service = connection_service
+
+        scaffold_dao = ScaffoldJobDAO(auth_engine)
+        app.state.scaffold_dao = scaffold_dao
+        app.state.scaffold_service = ScaffoldService(
+            dao=scaffold_dao, connection_service=connection_service
+        )
         log.info("connections.initialised")
     except Exception as exc:  # noqa: BLE001
         log.warning("auth.init_failed", error=str(exc))
@@ -238,6 +253,7 @@ async def _startup(app: FastAPI) -> None:
         app.state.auth_service = None
         app.state.auth_engine = None
         app.state.connection_service = None
+        app.state.scaffold_service = None
 
     # Step 9 — Build pattern cache
     from backend.pattern_cache.cache.pattern_cache import PatternCache
