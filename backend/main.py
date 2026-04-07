@@ -78,9 +78,11 @@ def _register_routers(app: FastAPI) -> None:
     from backend.pattern_cache.api.rest_router import router as patterns_router
     from backend.skill_registry.api.rest_router import router as skill_router
     from backend.skill_registry.api.widgets_router import router as widgets_router
+    from backend.tenants.connections.routes import router as connections_router
 
     prefix = "/api/v1"
     app.include_router(auth_router, prefix=prefix, tags=["auth"])
+    app.include_router(connections_router, prefix=prefix, tags=["admin-connections"])
     app.include_router(skill_router, prefix=prefix, tags=["skill-registry"])
     app.include_router(patterns_router, prefix=prefix, tags=["pattern-cache"])
     app.include_router(entities_router, prefix=prefix, tags=["entities"])
@@ -174,14 +176,18 @@ async def _startup(app: FastAPI) -> None:
     from backend.adapters.registry import initialise_adapters
     await initialise_adapters(str(adapters_registry_path), pg_settings, skill_registry=registry)
 
-    # Step 7 — Initialise metering + auth subsystems (share the internal schema)
+    # Step 7 — Initialise metering + auth + connections subsystems
     from backend.auth.models.tables import configure_schema as configure_auth_schema
     from backend.metering.models.tables import configure_schema
     from backend.metering.service import create_metering_service
     from backend.adapters.postgresql.engine import PostgreSQLEngine as _PGEngine
+    from backend.tenants.connections.tables import (
+        configure_schema as configure_connections_schema,
+    )
 
     configure_schema(internal_settings.db_schema)
     configure_auth_schema(internal_settings.db_schema)
+    configure_connections_schema(internal_settings.db_schema)
 
     metering_service = None
     try:
@@ -217,11 +223,21 @@ async def _startup(app: FastAPI) -> None:
         app.state.auth_engine = auth_engine
         app.state.auth_service = AuthService(auth_dao, settings=auth_settings)
         log.info("auth.initialised", schema=internal_settings.db_schema)
+
+        # Connections share the same engine — they live in the same schema.
+        from backend.tenants.connections.dao import ConnectionDAO
+        from backend.tenants.connections.service import ConnectionService
+
+        connection_dao = ConnectionDAO(auth_engine)
+        app.state.connection_dao = connection_dao
+        app.state.connection_service = ConnectionService(connection_dao)
+        log.info("connections.initialised")
     except Exception as exc:  # noqa: BLE001
         log.warning("auth.init_failed", error=str(exc))
         app.state.auth_dao = None
         app.state.auth_service = None
         app.state.auth_engine = None
+        app.state.connection_service = None
 
     # Step 9 — Build pattern cache
     from backend.pattern_cache.cache.pattern_cache import PatternCache

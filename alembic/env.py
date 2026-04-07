@@ -15,6 +15,10 @@ from backend.auth.models.tables import auth_metadata
 from backend.auth.models.tables import configure_schema as configure_auth_schema
 from backend.metering.models.tables import configure_schema, metering_metadata
 from backend.skill_registry.config.settings import internal_settings, pg_settings
+from backend.tenants.connections.tables import (
+    configure_schema as configure_connections_schema,
+    connections_metadata,
+)
 
 # ---------------------------------------------------------------------------
 # Alembic config object (alembic.ini)
@@ -28,7 +32,8 @@ if config.config_file_name is not None:
 # ---------------------------------------------------------------------------
 configure_schema(internal_settings.db_schema)
 configure_auth_schema(internal_settings.db_schema)
-target_metadata = [metering_metadata, auth_metadata]
+configure_connections_schema(internal_settings.db_schema)
+target_metadata = [metering_metadata, auth_metadata, connections_metadata]
 
 DB_URL = internal_settings.resolved_db_url(pg_settings)
 
