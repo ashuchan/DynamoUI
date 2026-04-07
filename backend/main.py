@@ -272,6 +272,14 @@ async def _startup(app: FastAPI) -> None:
         app.state.registry_dao = registry_dao
         app.state.registry_cache = registry_cache
         app.state.registry_service = registry_service
+
+        # Register Phase 5 cloud adapter testers + scaffolders.
+        from backend.adapters.cloud_registry import register_cloud_adapters
+
+        register_cloud_adapters(
+            connection_service=connection_service,
+            scaffold_service=app.state.scaffold_service,
+        )
         log.info(
             "connections.initialised",
             registry_cache_size=tenant_registry_settings.registry_cache_size,

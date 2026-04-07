@@ -33,6 +33,14 @@ dev = [
     "httpx>=0.27.0",
     "anyio>=4.3.0",
 ]
+# Phase 5 cloud adapters — install only the kinds you actually use.
+dynamodb = ["boto3>=1.34.0"]
+spanner = ["google-cloud-spanner>=3.47.0"]
+oracle = ["oracledb>=2.2.0"]
+cosmosdb = ["azure-cosmos>=4.7.0"]
+bigquery = ["google-cloud-bigquery>=3.20.0"]
+redshift = ["redshift-connector>=2.1.0"]
+snowflake = ["snowflake-connector-python>=3.10.0"]
 
 [project.scripts]
 dynamoui = "backend.skill_registry.cli.validate:cli"
