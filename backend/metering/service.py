@@ -122,10 +122,11 @@ class MeteringService:
     async def record_llm_interaction(
         self,
         dto: LLMInteractionCreateDTO,
-    ) -> None:
+    ) -> Decimal:
         """
         Resolve the active cost rate, compute cost_usd, and insert the
         metering_llm_interactions row. Swallows all exceptions.
+        Returns the computed cost_usd (Decimal("0") on failure or missing rate).
         """
         try:
             rate = await self._rates.get_active_rate(
@@ -157,12 +158,14 @@ class MeteringService:
                 total_tokens=dto.total_tokens,
                 cost_usd=str(cost_usd),
             )
+            return cost_usd
         except Exception as exc:
             log.warning(
                 "metering.record_llm_interaction_failed",
                 operation_id=str(dto.operation_id),
                 error=str(exc),
             )
+            return _ZERO
 
     # -------------------------------------------------------------------------
     # Cost rate management (used by API routes)

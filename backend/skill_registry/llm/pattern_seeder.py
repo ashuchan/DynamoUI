@@ -68,6 +68,17 @@ class PatternSeeder:
 
     def __init__(self, provider: LLMProvider) -> None:
         self._provider = provider
+        self._prompt_tokens: int = 0
+        self._completion_tokens: int = 0
+        self._llm_calls: int = 0
+
+    def get_token_usage(self) -> dict:
+        """Return accumulated token usage across all LLM calls made by this seeder."""
+        return {
+            "prompt_tokens": self._prompt_tokens,
+            "completion_tokens": self._completion_tokens,
+            "llm_calls": self._llm_calls,
+        }
 
     async def seed_patterns(
         self,
@@ -93,6 +104,9 @@ class PatternSeeder:
             user_prompt += f"\n{role_section}"
         try:
             llm_response = await self._provider.complete(SEED_SYSTEM_PROMPT, user_prompt)
+            self._prompt_tokens += llm_response.prompt_tokens
+            self._completion_tokens += llm_response.completion_tokens
+            self._llm_calls += 1
             raw = llm_response.text
             if not raw:
                 return []
@@ -154,6 +168,9 @@ class PatternSeeder:
             )
         try:
             llm_response = await self._provider.complete(BATCH_SEED_SYSTEM_PROMPT, user_prompt)
+            self._prompt_tokens += llm_response.prompt_tokens
+            self._completion_tokens += llm_response.completion_tokens
+            self._llm_calls += 1
             raw = llm_response.text
             if not raw:
                 return {}

@@ -75,37 +75,38 @@ class MeteringLLMProvider(LLMProvider):
         error_message: str | None,
     ) -> None:
         """Fire-and-forget metering write — never raises."""
-        from backend.metering.dto.interaction_dto import LLMInteractionCreateDTO
-
-        success = error_message is None and response is not None
-
-        prompt_tokens = response.prompt_tokens if response else 0
-        completion_tokens = response.completion_tokens if response else 0
-        thinking_tokens = response.thinking_tokens if response else 0
-        total_tokens = prompt_tokens + completion_tokens + thinking_tokens
-        thinking_summary = response.thinking_summary if response else None
-        # Use the model echoed by the provider when available (Anthropic returns it)
-        model = (response.model if response and response.model else self._model)
-
-        dto = LLMInteractionCreateDTO(
-            id=uuid.uuid4(),
-            operation_id=ctx.operation_id,
-            tenant_id=ctx.tenant_id,
-            interaction_type=ctx.interaction_type,
-            provider=self._provider_name,
-            model=model,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            thinking_tokens=thinking_tokens,
-            total_tokens=total_tokens,
-            thinking_summary=thinking_summary,
-            latency_ms=latency_ms,
-            success=success,
-            error_message=error_message,
-        )
-
         try:
-            await self._metering.record_llm_interaction(dto)
+            from backend.metering.dto.interaction_dto import LLMInteractionCreateDTO
+
+            success = error_message is None and response is not None
+
+            prompt_tokens = response.prompt_tokens if response else 0
+            completion_tokens = response.completion_tokens if response else 0
+            thinking_tokens = response.thinking_tokens if response else 0
+            total_tokens = prompt_tokens + completion_tokens + thinking_tokens
+            thinking_summary = response.thinking_summary if response else None
+            # Use the model echoed by the provider when available (Anthropic returns it)
+            model = (response.model if response and response.model else self._model)
+
+            dto = LLMInteractionCreateDTO(
+                id=uuid.uuid4(),
+                operation_id=ctx.operation_id,
+                tenant_id=ctx.tenant_id,
+                interaction_type=ctx.interaction_type,
+                provider=self._provider_name,
+                model=model,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                thinking_tokens=thinking_tokens,
+                total_tokens=total_tokens,
+                thinking_summary=thinking_summary,
+                latency_ms=latency_ms,
+                success=success,
+                error_message=error_message,
+            )
+
+            cost = await self._metering.record_llm_interaction(dto)
+            ctx.accumulated_cost_usd += cost
         except Exception as exc:
             log.warning(
                 "metering_provider.record_failed",

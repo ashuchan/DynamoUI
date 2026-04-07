@@ -65,6 +65,11 @@ def do_run_migrations(connection) -> None:
 async def run_migrations_online() -> None:
     engine = create_async_engine(DB_URL)
     async with engine.connect() as connection:
+        schema = internal_settings.db_schema
+        await connection.execute(
+            __import__("sqlalchemy").text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
+        )
+        await connection.commit()
         await connection.run_sync(do_run_migrations)
     await engine.dispose()
 

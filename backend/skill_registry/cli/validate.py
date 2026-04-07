@@ -191,6 +191,33 @@ def _build_entity_role_context(
     return context_map.get(entity, []) + context_map.get("", [])
 
 
+def _print_seeder_cost(seeder: "PatternSeeder | None") -> None:  # noqa: F821
+    """Print LLM token usage and approximate cost for a scaffold run."""
+    if seeder is None:
+        return
+    usage = seeder.get_token_usage()
+    if usage["llm_calls"] == 0:
+        return
+    # Approximate rates per 1k tokens — matches seed data in metering_cost_rates.
+    # These are estimates; exact cost is recorded in the metering DB when wired.
+    _APPROX_RATES: dict[str, tuple[float, float]] = {
+        "claude-haiku": (0.00080, 0.00400),
+        "claude-sonnet": (0.00300, 0.01500),
+        "gemini": (0.00007, 0.00030),
+    }
+    input_rate, output_rate = 0.00080, 0.00400  # default to haiku
+    for key, rates in _APPROX_RATES.items():
+        pass  # rates resolved once seeder exposes model name; use default for now
+    approx_cost = (
+        usage["prompt_tokens"] / 1000 * input_rate
+        + usage["completion_tokens"] / 1000 * output_rate
+    )
+    click.echo(
+        f"\nLLM usage: {usage['prompt_tokens']} prompt + {usage['completion_tokens']} completion tokens "
+        f"({usage['llm_calls']} call(s)) — approx. ${approx_cost:.6f}"
+    )
+
+
 @cli.command("scaffold")
 @click.option(
     "--adapter",
@@ -289,6 +316,7 @@ def scaffold_command(
                     encoding="utf-8",
                 )
                 click.echo(f"Written: {skill_p}, {patterns_p}, {widgets_p}")
+            _print_seeder_cost(seeder)
         elif output_dir:
             out_dir = Path(output_dir)
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -322,6 +350,7 @@ def scaffold_command(
                     click.echo(output.patterns_yaml)
             else:
                 click.echo(f"Scaffolded {len(results)} table(s) to {output_dir} (skill, patterns, widgets)")
+            _print_seeder_cost(seeder)
         else:
             click.echo("ERROR: provide --table or --output-dir", err=True)
             sys.exit(1)

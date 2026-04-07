@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
+from decimal import Decimal
 from uuid import UUID
 
 
@@ -24,6 +25,7 @@ class MeteringContext:
     operation_id: UUID
     interaction_type: str
     tenant_id: UUID | None = None
+    accumulated_cost_usd: Decimal = field(default_factory=lambda: Decimal("0"))
 
 
 _current_metering: ContextVar[MeteringContext | None] = ContextVar(

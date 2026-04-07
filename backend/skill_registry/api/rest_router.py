@@ -149,6 +149,7 @@ class ResolveResponse(BaseModel):
     query_plan: dict | None = None
     did_you_mean: str | None = None
     source: Literal["pattern_cache", "llm_synthesis", "none"] = "none"
+    llm_cost_usd: float | None = None
 
 
 def _parse_pattern_template_to_plan(
@@ -407,6 +408,7 @@ async def resolve_input(body: ResolveRequest, request: Request) -> ResolveRespon
             query_plan_and_confidence = await synthesiser.synthesise(raw_input, registry)
             if query_plan_and_confidence is not None:
                 query_plan, synthesis_confidence = query_plan_and_confidence
+                synthesised_entity = query_plan.entity  # preserve even if execution fails
                 skill = registry.entity_by_name.get(query_plan.entity)
                 if skill is not None:
                     from backend.adapters.registry import get_adapter_registry
@@ -449,6 +451,20 @@ async def resolve_input(body: ResolveRequest, request: Request) -> ResolveRespon
                             error_msg = str(exc)[:1000]
                             success = False
 
+                # Execution failed or entity/adapter not found — navigate to the
+                # entity that the LLM identified (if it's in the registry) so the
+                # DataTable shows the default list view rather than a generic error.
+                if synthesised_entity in registry.entity_by_name:
+                    log.info("api.resolve.entity_fallback",
+                             input_hash=input_hash, entity=synthesised_entity)
+                    response = ResolveResponse(
+                        intent="READ",
+                        entity=synthesised_entity,
+                        confidence=synthesis_confidence,
+                        source="llm_synthesis",
+                    )
+                    return response
+
         log.info("api.resolve.unresolved", input_hash=input_hash)
         response = ResolveResponse(intent="READ", confidence=0.0, source="none")
         return response
@@ -459,6 +475,14 @@ async def resolve_input(body: ResolveRequest, request: Request) -> ResolveRespon
 
     finally:
         # ── Metering: close the operation row ─────────────────────────────────
+        # Read accumulated LLM cost from context before clearing it
+        from backend.metering.context import get_metering_context
+        _metering_ctx = get_metering_context()
+        if _metering_ctx is not None and response is not None:
+            _cost = float(_metering_ctx.accumulated_cost_usd)
+            if _cost > 0:
+                response.llm_cost_usd = _cost
+
         if metering_ctx_token is not None:
             clear_metering_context(metering_ctx_token)
         if metering_svc is not None and operation_id is not None:
