@@ -14,6 +14,18 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from backend.auth.models.tables import auth_metadata
 from backend.auth.models.tables import configure_schema as configure_auth_schema
 from backend.metering.models.tables import configure_schema, metering_metadata
+from backend.personalisation.models.tables import (
+    configure_schema as configure_personalisation_schema,
+    personalisation_metadata,
+)
+from backend.scheduling.models.tables import (
+    configure_schema as configure_scheduling_schema,
+    scheduling_metadata,
+)
+from backend.sharing.models.tables import (
+    configure_schema as configure_sharing_schema,
+    sharing_metadata,
+)
 from backend.skill_registry.config.settings import internal_settings, pg_settings
 from backend.tenants.connections.tables import (
     configure_schema as configure_connections_schema,
@@ -43,12 +55,18 @@ configure_auth_schema(internal_settings.db_schema)
 configure_connections_schema(internal_settings.db_schema)
 configure_scaffold_schema(internal_settings.db_schema)
 configure_registry_schema(internal_settings.db_schema)
+configure_personalisation_schema(internal_settings.db_schema)
+configure_scheduling_schema(internal_settings.db_schema)
+configure_sharing_schema(internal_settings.db_schema)
 target_metadata = [
     metering_metadata,
     auth_metadata,
     connections_metadata,
     scaffold_metadata,
     registry_metadata,
+    personalisation_metadata,
+    scheduling_metadata,
+    sharing_metadata,
 ]
 
 DB_URL = internal_settings.resolved_db_url(pg_settings)

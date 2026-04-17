@@ -21,13 +21,17 @@ import structlog
 from fastapi import FastAPI
 
 from backend.skill_registry.config.settings import (
+    FeatureFlagSettings,
     PatternCacheSettings,
     SkillRegistrySettings,
+    VerifierSettings,
     configure_logging,
+    feature_settings,
     internal_settings,
     pg_settings,
     skill_settings,
     cache_settings,
+    verifier_settings,
 )
 from backend.skill_registry.models.registry import SkillRegistry
 
@@ -76,6 +80,10 @@ def _register_routers(app: FastAPI) -> None:
     from backend.auth.api.routes import router as auth_router
     from backend.metering.api.routes import router as metering_router
     from backend.pattern_cache.api.rest_router import router as patterns_router
+    from backend.personalisation.api.rest_router import router as personalisation_router
+    from backend.query_engine.api.rest_router import router as query_engine_router
+    from backend.scheduling.api.rest_router import router as scheduling_router
+    from backend.sharing.api.rest_router import router as sharing_router
     from backend.skill_registry.api.rest_router import router as skill_router
     from backend.skill_registry.api.widgets_router import router as widgets_router
     from backend.tenants.connections.routes import router as connections_router
@@ -92,6 +100,13 @@ def _register_routers(app: FastAPI) -> None:
     app.include_router(entities_router, prefix=prefix, tags=["entities"])
     app.include_router(widgets_router, prefix=prefix, tags=["widgets"])
     app.include_router(metering_router, prefix=f"{prefix}/metering", tags=["metering"])
+    # v2 routers — registered unconditionally; each router 503s if its
+    # subsystem failed to initialise so feature flags remain the single
+    # source of truth.
+    app.include_router(query_engine_router, prefix=prefix, tags=["resolve-v2"])
+    app.include_router(personalisation_router, prefix=prefix, tags=["personalisation"])
+    app.include_router(scheduling_router, prefix=prefix, tags=["scheduling"])
+    app.include_router(sharing_router, prefix=prefix, tags=["sharing"])
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +200,15 @@ async def _startup(app: FastAPI) -> None:
     from backend.metering.models.tables import configure_schema
     from backend.metering.service import create_metering_service
     from backend.adapters.postgresql.engine import PostgreSQLEngine as _PGEngine
+    from backend.personalisation.models.tables import (
+        configure_schema as configure_personalisation_schema,
+    )
+    from backend.scheduling.models.tables import (
+        configure_schema as configure_scheduling_schema,
+    )
+    from backend.sharing.models.tables import (
+        configure_schema as configure_sharing_schema,
+    )
     from backend.tenants.connections.tables import (
         configure_schema as configure_connections_schema,
     )
@@ -200,6 +224,9 @@ async def _startup(app: FastAPI) -> None:
     configure_connections_schema(internal_settings.db_schema)
     configure_scaffold_schema(internal_settings.db_schema)
     configure_registry_schema(internal_settings.db_schema)
+    configure_personalisation_schema(internal_settings.db_schema)
+    configure_scheduling_schema(internal_settings.db_schema)
+    configure_sharing_schema(internal_settings.db_schema)
 
     metering_service = None
     try:
@@ -362,6 +389,9 @@ async def _startup(app: FastAPI) -> None:
         on_promote_callback=_on_pattern_promoted,
     )
 
+    # Step 11 — Wire v2 subsystems (verifier, personalisation, scheduling, sharing)
+    await _wire_v2_subsystems(app, llm_provider=llm_provider, registry=registry, pattern_cache=pattern_cache)
+
     boot_time_ms = (time.monotonic() - t0) * 1000
     registry.boot_time_ms = boot_time_ms
 
@@ -373,6 +403,139 @@ async def _startup(app: FastAPI) -> None:
         enums_loaded=registry.enums_loaded,
         patterns_loaded=registry.patterns_loaded,
     )
+
+
+async def _wire_v2_subsystems(
+    app: FastAPI,
+    *,
+    llm_provider,
+    registry,
+    pattern_cache,
+) -> None:
+    """Initialise v2 modules: verifier, personalisation, scheduling, sharing.
+
+    Each subsystem is individually wrapped — a failure in one does not prevent
+    the rest from coming up, and the routers 503 gracefully if their service
+    is missing.
+    """
+    auth_engine = getattr(app.state, "auth_engine", None)
+    if auth_engine is None:
+        log.warning("v2.auth_engine_unavailable_skipping")
+        return
+
+    # ------------------------------------------------------------------
+    # LLM Verifier
+    # ------------------------------------------------------------------
+    try:
+        from backend.query_engine.verifier.cache import VerdictCache
+        from backend.query_engine.verifier.gap_recorder import PatternGapRecorder
+        from backend.query_engine.verifier.llm_verifier import LLMVerifier
+
+        verdict_cache = VerdictCache(max_size=verifier_settings.verdict_cache_size)
+        gap_recorder = PatternGapRecorder(
+            engine=auth_engine, schema=internal_settings.db_schema
+        )
+        verifier = LLMVerifier(
+            settings=verifier_settings,
+            llm_provider=llm_provider,
+            cache=verdict_cache,
+            gap_recorder=gap_recorder,
+        )
+        app.state.llm_verifier = verifier
+        app.state.verdict_cache = verdict_cache
+        log.info(
+            "verifier.initialised",
+            enabled=verifier_settings.enabled,
+            on_llm_failure=verifier_settings.on_llm_failure,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("verifier.init_failed", error=str(exc))
+        app.state.llm_verifier = None
+
+    # ------------------------------------------------------------------
+    # Resolve pipeline (replaces legacy /resolve glue logic, available at /resolve/v2)
+    # ------------------------------------------------------------------
+    try:
+        from backend.query_engine.pipeline import ResolvePipeline
+
+        if app.state.llm_verifier is not None:
+            app.state.resolve_pipeline = ResolvePipeline(
+                registry=registry,
+                pattern_cache=pattern_cache,
+                synthesiser=getattr(app.state, "query_synthesiser", None),
+                verifier=app.state.llm_verifier,
+                features=feature_settings,
+            )
+            log.info("resolve_pipeline.initialised")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("resolve_pipeline.init_failed", error=str(exc))
+        app.state.resolve_pipeline = None
+
+    # ------------------------------------------------------------------
+    # Personalisation
+    # ------------------------------------------------------------------
+    if feature_settings.personalisation:
+        try:
+            from backend.personalisation.services.dashboard_service import (
+                DashboardService,
+                PinService,
+            )
+            from backend.personalisation.services.personalisation_service import (
+                PersonalisationService,
+            )
+            from backend.personalisation.services.saved_view_service import SavedViewService
+
+            saved_views = SavedViewService(
+                auth_engine,
+                registry=registry,
+                verifier=app.state.llm_verifier,
+                features=feature_settings,
+            )
+            dashboards = DashboardService(auth_engine)
+            pins = PinService(auth_engine)
+            app.state.personalisation_service = PersonalisationService(
+                saved_views=saved_views, dashboards=dashboards, pins=pins
+            )
+            log.info("personalisation.initialised")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("personalisation.init_failed", error=str(exc))
+            app.state.personalisation_service = None
+
+    # ------------------------------------------------------------------
+    # Scheduling + Alerts
+    # ------------------------------------------------------------------
+    if feature_settings.scheduling:
+        try:
+            from backend.scheduling.services.schedule_service import ScheduleService
+
+            app.state.schedule_service = ScheduleService(auth_engine)
+            log.info("scheduling.initialised")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("scheduling.init_failed", error=str(exc))
+            app.state.schedule_service = None
+
+    if feature_settings.alerts:
+        try:
+            from backend.scheduling.services.alert_service import AlertService
+
+            app.state.alert_service = AlertService(auth_engine)
+            log.info("alerts.initialised")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("alerts.init_failed", error=str(exc))
+            app.state.alert_service = None
+
+    # ------------------------------------------------------------------
+    # Sharing
+    # ------------------------------------------------------------------
+    if feature_settings.sharing:
+        try:
+            from backend.sharing.services.share_service import ShareService
+
+            app.state.share_service = ShareService(auth_engine)
+            log.info("sharing.initialised")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("sharing.init_failed", error=str(exc))
+            app.state.share_service = None
 
 
 async def _shutdown(app: FastAPI) -> None:

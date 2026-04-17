@@ -182,6 +182,74 @@ class LLMSettings(BaseSettings):
     )
 
 
+class VerifierSettings(BaseSettings):
+    """DYNAMO_VERIFIER_* environment variables — controls the LLM verification loop.
+
+    The whole loop is gated by ``enabled``. When False (default), /resolve
+    behaves exactly as it did pre-v2: pattern cache → LLM synth, no verifier.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="DYNAMO_VERIFIER_",
+        case_sensitive=False,
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    enabled: bool = Field(
+        False,
+        description="Master toggle for the LLM verification loop. Default off.",
+    )
+    verify_cache_hits: bool = Field(True)
+    verify_synthesised: bool = Field(False)
+    verify_templates: bool = Field(True)
+    verify_saved_views: bool = Field(False)
+    skip_on_confidence_above: float = Field(0.98)
+    skip_intents: list[str] = Field(default_factory=lambda: ["NAVIGATE"])
+    llm_timeout_ms: int = Field(1500)
+    on_llm_failure: Literal["approve_candidate", "reject_and_synth"] = Field(
+        "approve_candidate",
+        description="Graceful degradation when the verifier LLM call fails or times out.",
+    )
+    verifier_model: str = Field(
+        "",
+        description="Override model for verifier. Empty → share the primary LLM model.",
+    )
+    verdict_cache_size: int = Field(2048, description="LRU size for verdict cache.")
+    monthly_budget_usd: float = Field(
+        0.0,
+        description="Per-tenant monthly budget. 0 = unlimited. Enforced by circuit breaker.",
+    )
+    parallel_execution: bool = Field(
+        True,
+        description="Start candidate execution in parallel with verification (cache-hit path).",
+    )
+
+
+class FeatureFlagSettings(BaseSettings):
+    """DYNAMO_FEATURE_* environment variables — cluster on/off switches for v2."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="DYNAMO_FEATURE_",
+        case_sensitive=False,
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    personalisation: bool = Field(True, description="M2 — saved views + dashboards")
+    provenance: bool = Field(True, description="M4 — provenance envelope on responses")
+    scheduling: bool = Field(True, description="M5 — scheduled delivery")
+    alerts: bool = Field(True, description="M6 — threshold alerts")
+    palette: bool = Field(True, description="M7 — command palette + slash commands")
+    sharing: bool = Field(True, description="M8 — shareable links + embed tokens")
+    expose_sql: bool = Field(
+        False,
+        description="Include generated SQL in the provenance envelope. Default off in prod.",
+    )
+
+
 class InternalSettings(BaseSettings):
     """
     DYNAMO_INTERNAL_* — configuration for DynamoUI-managed internal tables.
@@ -223,6 +291,8 @@ pg_settings = PostgreSQLSettings()
 cache_settings = PatternCacheSettings()
 llm_settings = LLMSettings()
 internal_settings = InternalSettings()
+verifier_settings = VerifierSettings()
+feature_settings = FeatureFlagSettings()
 
 
 def configure_logging(settings: SkillRegistrySettings = skill_settings) -> None:
