@@ -31,11 +31,19 @@ def upgrade() -> None:
     # ── Schema ─────────────────────────────────────────────────────────────
     op.execute(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}")
 
-    # Grant write user access to the schema (idempotent)
-    op.execute(f"GRANT USAGE ON SCHEMA {SCHEMA} TO dynamoui_writer")
+    # Grant write user access to the schema only if the role exists (idempotent)
     op.execute(
-        f"ALTER DEFAULT PRIVILEGES IN SCHEMA {SCHEMA} "
-        f"GRANT SELECT, INSERT, UPDATE ON TABLES TO dynamoui_writer"
+        f"""
+        DO $$
+        BEGIN
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'dynamoui_writer') THEN
+                GRANT USAGE ON SCHEMA {SCHEMA} TO dynamoui_writer;
+                ALTER DEFAULT PRIVILEGES IN SCHEMA {SCHEMA}
+                    GRANT SELECT, INSERT, UPDATE ON TABLES TO dynamoui_writer;
+            END IF;
+        END
+        $$;
+        """
     )
 
     # ── metering_cost_rates ─────────────────────────────────────────────────

@@ -1,8 +1,0 @@
-entity: BadEntity
-table: bad_entity
-adapter: postgresql
-description: Entity without a primary key — should fail Phase 1 validation
-fields:
-  - name: name
-    type: string
-    nullable: false
