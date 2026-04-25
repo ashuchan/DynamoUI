@@ -28,11 +28,11 @@ class PersonalisationService:
         self.dashboards = dashboards
         self.pins = pins
 
-    async def compose_home(self, *, user_id: UUID) -> dict:
+    async def compose_home(self, *, user_id: UUID, tenant_id: UUID) -> dict:
         pins = await self.pins.list(user_id=user_id)
         dashes = await self.dashboards.list(owner_id=user_id)
         default_dash = next((d for d in dashes if d.isDefault), None)
-        views = await self.saved_views.list(owner_id=user_id)
+        views = await self.saved_views.list(owner_id=user_id, tenant_id=tenant_id)
         return {
             "pins": [p.model_dump() for p in pins],
             "defaultDashboard": default_dash.model_dump() if default_dash else None,
@@ -42,8 +42,6 @@ class PersonalisationService:
         }
 
     async def search_saved_views(self, q: str, *, limit: int = 20) -> list[dict]:
-        # No owner filter here — caller-level routes already enforce ownership.
-        # Used by the universal-search router.
         return []
 
     async def search_dashboards(self, q: str, *, limit: int = 20) -> list[dict]:

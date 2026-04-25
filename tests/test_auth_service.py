@@ -6,6 +6,7 @@ flow) are exercised here.
 """
 from __future__ import annotations
 
+import time
 from datetime import datetime
 from typing import Any
 from uuid import UUID, uuid4
@@ -313,6 +314,9 @@ async def test_google_signup_creates_tenant(
         assert id_token == "fake-google-token"
         return {
             "aud": settings.google_client_id,
+            "iss": "accounts.google.com",
+            "exp": int(time.time()) + 600,
+            "email_verified": True,
             "sub": "google-sub-123",
             "email": "bob@example.com",
             "name": "Bob Brown",
@@ -332,6 +336,9 @@ async def test_google_login_reuses_existing_identity(
     async def verifier(id_token: str) -> dict:
         return {
             "aud": settings.google_client_id,
+            "iss": "accounts.google.com",
+            "exp": int(time.time()) + 600,
+            "email_verified": True,
             "sub": "sub-42",
             "email": "carol@example.com",
             "name": "Carol",
@@ -352,6 +359,9 @@ async def test_google_audience_mismatch_rejected(
     async def verifier(id_token: str) -> dict:
         return {
             "aud": "some-other-client-id",
+            "iss": "accounts.google.com",
+            "exp": int(time.time()) + 600,
+            "email_verified": True,
             "sub": "sub",
             "email": "e@x.com",
             "name": "E",
@@ -390,6 +400,9 @@ async def test_google_links_existing_email_user(
     async def verifier(id_token: str) -> dict:
         return {
             "aud": settings.google_client_id,
+            "iss": "accounts.google.com",
+            "exp": int(time.time()) + 600,
+            "email_verified": True,
             "sub": "dana-sub",
             "email": "d@example.com",
             "name": "Dana",

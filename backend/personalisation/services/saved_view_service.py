@@ -83,34 +83,55 @@ class SavedViewService:
             )
         return await self.get(row_id, owner_id=owner_id)
 
-    async def list(self, *, owner_id: UUID, entity: str | None = None, shared: bool = False) -> list[SavedViewRead]:
+    async def list(
+        self,
+        *,
+        owner_id: UUID,
+        tenant_id: UUID,
+        entity: str | None = None,
+        shared: bool = False,
+    ) -> list[SavedViewRead]:
         async with self._engine.connect() as conn:
+            own_clause = saved_views.c.owner_user_id == owner_id
+            visibility = (
+                sa.or_(own_clause, saved_views.c.is_shared == True)  # noqa: E712
+                if shared
+                else own_clause
+            )
             stmt = sa.select(saved_views).where(
-                sa.or_(
-                    saved_views.c.owner_user_id == owner_id,
-                    sa.and_(saved_views.c.is_shared == True, sa.literal(shared)),
-                )
+                sa.and_(saved_views.c.tenant_id == tenant_id, visibility)
             )
             if entity:
                 stmt = stmt.where(saved_views.c.entity == entity)
             rows = (await conn.execute(stmt)).mappings().all()
         return [_row_to_read(r) for r in rows]
 
-    async def get(self, view_id: UUID, *, owner_id: UUID | None = None) -> SavedViewRead:
+    async def get(
+        self,
+        view_id: UUID,
+        *,
+        owner_id: UUID,
+        tenant_id: UUID,
+    ) -> SavedViewRead:
         async with self._engine.connect() as conn:
             row = (
                 await conn.execute(
-                    sa.select(saved_views).where(saved_views.c.id == view_id)
+                    sa.select(saved_views).where(
+                        sa.and_(
+                            saved_views.c.id == view_id,
+                            saved_views.c.tenant_id == tenant_id,
+                        )
+                    )
                 )
             ).mappings().first()
         if row is None:
             raise SavedViewNotFound(str(view_id))
-        if owner_id is not None and row["owner_user_id"] != owner_id and not row["is_shared"]:
+        if row["owner_user_id"] != owner_id and not row["is_shared"]:
             raise SavedViewNotFound(str(view_id))
         return _row_to_read(row)
 
     async def update(
-        self, view_id: UUID, *, owner_id: UUID, payload: SavedViewUpdate
+        self, view_id: UUID, *, owner_id: UUID, tenant_id: UUID, payload: SavedViewUpdate
     ) -> SavedViewRead:
         values = {k: v for k, v in payload.model_dump().items() if v is not None}
         if values:
@@ -124,19 +145,25 @@ class SavedViewService:
                 await conn.execute(
                     sa.update(saved_views)
                     .where(
-                        saved_views.c.id == view_id,
-                        saved_views.c.owner_user_id == owner_id,
+                        sa.and_(
+                            saved_views.c.id == view_id,
+                            saved_views.c.owner_user_id == owner_id,
+                            saved_views.c.tenant_id == tenant_id,
+                        )
                     )
                     .values(**mapped)
                 )
-        return await self.get(view_id, owner_id=owner_id)
+        return await self.get(view_id, owner_id=owner_id, tenant_id=tenant_id)
 
-    async def delete(self, view_id: UUID, *, owner_id: UUID) -> None:
+    async def delete(self, view_id: UUID, *, owner_id: UUID, tenant_id: UUID) -> None:
         async with self._engine.begin() as conn:
             await conn.execute(
                 sa.delete(saved_views).where(
-                    saved_views.c.id == view_id,
-                    saved_views.c.owner_user_id == owner_id,
+                    sa.and_(
+                        saved_views.c.id == view_id,
+                        saved_views.c.owner_user_id == owner_id,
+                        saved_views.c.tenant_id == tenant_id,
+                    )
                 )
             )
 
@@ -145,9 +172,9 @@ class SavedViewService:
     # ------------------------------------------------------------------
 
     async def execute(
-        self, view_id: UUID, *, owner_id: UUID
+        self, view_id: UUID, *, owner_id: UUID, tenant_id: UUID
     ) -> ExecutedResult:
-        view = await self.get(view_id, owner_id=owner_id)
+        view = await self.get(view_id, owner_id=owner_id, tenant_id=tenant_id)
         current_hash = compute_skill_hash(self._registry)
 
         plan = _parse_plan(view.queryPlan, view.entity)
@@ -223,18 +250,23 @@ class SavedViewService:
     # Search (for /api/v1/search)
     # ------------------------------------------------------------------
 
-    async def search(self, q: str, *, owner_id: UUID, limit: int = 20) -> list[dict]:
+    async def search(
+        self, q: str, *, owner_id: UUID, tenant_id: UUID, limit: int = 20
+    ) -> list[dict]:
         qlow = q.lower()
         async with self._engine.connect() as conn:
             rows = (
                 await conn.execute(
                     sa.select(saved_views.c.id, saved_views.c.name, saved_views.c.entity)
                     .where(
-                        sa.or_(
-                            saved_views.c.owner_user_id == owner_id,
-                            saved_views.c.is_shared == True,
-                        ),
-                        sa.func.lower(saved_views.c.name).like(f"%{qlow}%"),
+                        sa.and_(
+                            saved_views.c.tenant_id == tenant_id,
+                            sa.or_(
+                                saved_views.c.owner_user_id == owner_id,
+                                saved_views.c.is_shared == True,  # noqa: E712
+                            ),
+                            sa.func.lower(saved_views.c.name).like(f"%{qlow}%"),
+                        )
                     )
                     .limit(limit)
                 )

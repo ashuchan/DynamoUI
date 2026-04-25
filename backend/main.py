@@ -25,6 +25,7 @@ from backend.skill_registry.config.settings import (
     PatternCacheSettings,
     SkillRegistrySettings,
     VerifierSettings,
+    canvas_settings,
     configure_logging,
     feature_settings,
     internal_settings,
@@ -89,6 +90,7 @@ def _register_routers(app: FastAPI) -> None:
     from backend.tenants.connections.routes import router as connections_router
     from backend.tenants.registry.routes import router as registry_router
     from backend.tenants.scaffold.routes import router as scaffold_router
+    from backend.canvas.api.rest_router import router as canvas_router
 
     prefix = "/api/v1"
     app.include_router(auth_router, prefix=prefix, tags=["auth"])
@@ -107,6 +109,7 @@ def _register_routers(app: FastAPI) -> None:
     app.include_router(personalisation_router, prefix=prefix, tags=["personalisation"])
     app.include_router(scheduling_router, prefix=prefix, tags=["scheduling"])
     app.include_router(sharing_router, prefix=prefix, tags=["sharing"])
+    app.include_router(canvas_router, prefix=prefix, tags=["canvas"])
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +221,9 @@ async def _startup(app: FastAPI) -> None:
     from backend.tenants.scaffold.tables import (
         configure_schema as configure_scaffold_schema,
     )
+    from backend.canvas.models.session import (
+        configure_schema as configure_canvas_schema,
+    )
 
     configure_schema(internal_settings.db_schema)
     configure_auth_schema(internal_settings.db_schema)
@@ -227,6 +233,7 @@ async def _startup(app: FastAPI) -> None:
     configure_personalisation_schema(internal_settings.db_schema)
     configure_scheduling_schema(internal_settings.db_schema)
     configure_sharing_schema(internal_settings.db_schema)
+    configure_canvas_schema(internal_settings.db_schema)
 
     metering_service = None
     try:
@@ -536,6 +543,66 @@ async def _wire_v2_subsystems(
         except Exception as exc:  # noqa: BLE001
             log.warning("sharing.init_failed", error=str(exc))
             app.state.share_service = None
+
+    # ------------------------------------------------------------------
+    # Canvas (LLD 9)
+    # ------------------------------------------------------------------
+    if canvas_settings.enabled:
+        try:
+            from pathlib import Path as _Path
+
+            from backend.canvas.conversation.driver import ConversationDriver
+            from backend.canvas.dao import CanvasSessionDAO
+            from backend.canvas.generator import CanvasGenerator
+            from backend.canvas.preview.synthetic_data import PreviewBuilder
+            from backend.canvas.synthesis.domain_pattern_seeder import (
+                CanvasDomainPatternSeeder,
+            )
+            from backend.canvas.synthesis.layout_synthesiser import LayoutSynthesiser
+            from backend.canvas.synthesis.skill_enricher import SkillEnricher
+            from backend.canvas.synthesis.theme_synthesiser import ThemeSynthesiser
+
+            theme_synth = ThemeSynthesiser()
+            layout_synth = LayoutSynthesiser()
+            enricher = SkillEnricher()
+            seeder = CanvasDomainPatternSeeder(canvas_settings.domain_patterns_dir)
+
+            app.state.canvas_dao = CanvasSessionDAO(auth_engine)
+            app.state.canvas_driver = ConversationDriver(
+                llm=llm_provider,
+                max_turns=canvas_settings.max_conversation_turns,
+                conversation_temperature=canvas_settings.conversation_temperature,
+            )
+            app.state.canvas_preview = PreviewBuilder(
+                theme=theme_synth, layout=layout_synth, enricher=enricher
+            )
+            app.state.canvas_generator = CanvasGenerator(
+                output_dir=_Path(canvas_settings.output_dir),
+                theme=theme_synth,
+                layout=layout_synth,
+                enricher=enricher,
+                seeder=seeder,
+            )
+            # Surface enum values to the preview builder for realistic kanban grouping.
+            enum_values: dict[str, list[str]] = {}
+            for enum_name, enum in getattr(registry, "enum_by_name", {}).items():
+                values = getattr(enum, "values", None) or []
+                enum_values[enum_name] = [
+                    getattr(v, "value", v) for v in values
+                ]
+            app.state.canvas_enum_values = enum_values
+
+            log.info(
+                "canvas.initialised",
+                output_dir=canvas_settings.output_dir,
+                max_turns=canvas_settings.max_conversation_turns,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("canvas.init_failed", error=str(exc))
+            app.state.canvas_dao = None
+            app.state.canvas_driver = None
+            app.state.canvas_preview = None
+            app.state.canvas_generator = None
 
 
 async def _shutdown(app: FastAPI) -> None:

@@ -76,7 +76,9 @@ async def list_views(
     entity: str | None = Query(None),
     shared: bool = Query(False),
 ) -> list[SavedViewRead]:
-    return await _sv(request).list(owner_id=ctx.user.id, entity=entity, shared=shared)
+    return await _sv(request).list(
+        owner_id=ctx.user.id, tenant_id=ctx.tenant.id, entity=entity, shared=shared
+    )
 
 
 @router.post("/views", response_model=SavedViewRead, status_code=201)
@@ -97,7 +99,9 @@ async def get_view(
     ctx: Annotated[AuthContext, Depends(get_current_context)],
 ) -> SavedViewRead:
     try:
-        return await _sv(request).get(view_id, owner_id=ctx.user.id)
+        return await _sv(request).get(
+            view_id, owner_id=ctx.user.id, tenant_id=ctx.tenant.id
+        )
     except SavedViewNotFound:
         raise HTTPException(status_code=404, detail="saved view not found")
 
@@ -109,7 +113,9 @@ async def update_view(
     request: Request,
     ctx: Annotated[AuthContext, Depends(get_current_context)],
 ) -> SavedViewRead:
-    return await _sv(request).update(view_id, owner_id=ctx.user.id, payload=payload)
+    return await _sv(request).update(
+        view_id, owner_id=ctx.user.id, tenant_id=ctx.tenant.id, payload=payload
+    )
 
 
 @router.delete("/views/{view_id}", status_code=204)
@@ -118,7 +124,7 @@ async def delete_view(
     request: Request,
     ctx: Annotated[AuthContext, Depends(get_current_context)],
 ):
-    await _sv(request).delete(view_id, owner_id=ctx.user.id)
+    await _sv(request).delete(view_id, owner_id=ctx.user.id, tenant_id=ctx.tenant.id)
 
 
 @router.post("/views/{view_id}/execute")
@@ -128,7 +134,9 @@ async def execute_view(
     ctx: Annotated[AuthContext, Depends(get_current_context)],
 ) -> ExecutedResult:
     try:
-        return await _sv(request).execute(view_id, owner_id=ctx.user.id)
+        return await _sv(request).execute(
+            view_id, owner_id=ctx.user.id, tenant_id=ctx.tenant.id
+        )
     except SavedViewNotFound:
         raise HTTPException(status_code=404, detail="saved view not found")
 
@@ -266,4 +274,6 @@ async def get_home(
     request: Request,
     ctx: Annotated[AuthContext, Depends(get_current_context)],
 ) -> dict:
-    return await _get_facade(request).compose_home(user_id=ctx.user.id)
+    return await _get_facade(request).compose_home(
+        user_id=ctx.user.id, tenant_id=ctx.tenant.id
+    )

@@ -422,14 +422,25 @@ async def resolve_input(body: ResolveRequest, request: Request) -> ResolveRespon
                             promoter = getattr(request.app.state, "pattern_promoter", None)
                             if promoter is not None:
                                 import asyncio
-                                asyncio.create_task(
-                                    promoter.promote(
-                                        user_input=raw_input,
-                                        query_plan=query_plan,
-                                        confidence=synthesis_confidence,
-                                        entity=query_plan.entity,
-                                    )
-                                )
+
+                                from backend.metering.context import detached_context
+
+                                async def _run_promoter():
+                                    try:
+                                        await promoter.promote(
+                                            user_input=raw_input,
+                                            query_plan=query_plan,
+                                            confidence=synthesis_confidence,
+                                            entity=query_plan.entity,
+                                        )
+                                    except Exception as exc:
+                                        log.warning(
+                                            "api.resolve.pattern_promote_failed",
+                                            error=str(exc),
+                                            entity=query_plan.entity,
+                                        )
+
+                                asyncio.create_task(_run_promoter(), context=detached_context())
 
                             log.info("api.resolve.llm_synthesis",
                                      input_hash=input_hash, entity=query_plan.entity,

@@ -14,6 +14,7 @@ Usage:
 """
 from __future__ import annotations
 
+import contextvars
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -46,3 +47,15 @@ def get_metering_context() -> MeteringContext | None:
 def clear_metering_context(token: Token) -> None:
     """Reset the context to the state before set_metering_context() was called."""
     _current_metering.reset(token)
+
+
+def detached_context() -> contextvars.Context:
+    """Snapshot the current context with the metering var cleared.
+
+    Pass as ``context=`` to ``asyncio.create_task`` for fire-and-forget work
+    so LLM calls in the background task don't bill against the parent
+    request's operation_id.
+    """
+    ctx = contextvars.copy_context()
+    ctx.run(_current_metering.set, None)
+    return ctx

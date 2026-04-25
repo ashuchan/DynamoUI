@@ -12,6 +12,7 @@ import json
 import re
 import unicodedata
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Awaitable, Callable
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -131,6 +132,18 @@ class AuthService:
         aud = payload.get("aud")
         if aud != self._settings.google_client_id:
             raise GoogleVerificationError("google token audience mismatch")
+        iss = payload.get("iss")
+        if iss not in ("accounts.google.com", "https://accounts.google.com"):
+            raise GoogleVerificationError("google token issuer mismatch")
+        exp_raw = payload.get("exp")
+        try:
+            exp_ts = int(exp_raw) if exp_raw is not None else None
+        except (TypeError, ValueError) as exc:
+            raise GoogleVerificationError("google token missing valid exp") from exc
+        if exp_ts is None or exp_ts <= int(datetime.now(timezone.utc).timestamp()):
+            raise GoogleVerificationError("google token expired")
+        if payload.get("email_verified") not in (True, "true", "True"):
+            raise GoogleVerificationError("google email not verified")
         subject = payload.get("sub")
         email = payload.get("email")
         if not subject or not email:

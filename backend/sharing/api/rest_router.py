@@ -4,9 +4,12 @@ from __future__ import annotations
 from typing import Annotated
 from uuid import UUID
 
+import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
+
+log = structlog.get_logger(__name__)
 
 from backend.auth.api.dependencies import AuthContext, get_current_context
 from backend.sharing.services.share_service import (
@@ -157,12 +160,22 @@ async def propose_pattern(
     # review queue rather than writing directly to the patterns YAML.
     import asyncio
 
-    asyncio.create_task(
-        promoter.promote(
-            user_input=payload.userInput,
-            query_plan=plan,
-            confidence=0.91,  # review-queue range
-            entity=plan.entity,
-        )
-    )
+    from backend.metering.context import detached_context
+
+    async def _queue_proposal():
+        try:
+            await promoter.promote(
+                user_input=payload.userInput,
+                query_plan=plan,
+                confidence=0.91,  # review-queue range
+                entity=plan.entity,
+            )
+        except Exception as exc:
+            log.warning(
+                "sharing.propose_pattern_failed",
+                error=str(exc),
+                entity=plan.entity,
+            )
+
+    asyncio.create_task(_queue_proposal(), context=detached_context())
     return {"proposalId": "queued", "status": "queued"}

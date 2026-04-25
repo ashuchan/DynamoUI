@@ -227,6 +227,51 @@ class VerifierSettings(BaseSettings):
     )
 
 
+class CanvasSettings(BaseSettings):
+    """DYNAMO_CANVAS_* — configuration for the Canvas conversational generator."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="DYNAMO_CANVAS_",
+        case_sensitive=False,
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    enabled: bool = Field(True, description="Master toggle for Canvas endpoints.")
+    llm_model: str = Field(
+        "claude-haiku-4-5-20251001",
+        description="Model used for fast conversation turns.",
+    )
+    generation_model: str = Field(
+        "claude-sonnet-4-6",
+        description="Model used for deterministic generation synthesis.",
+    )
+    conversation_temperature: float = Field(0.3)
+    generation_temperature: float = Field(0.0)
+    max_conversation_turns: int = Field(
+        20,
+        description="Per-session turn cap. Once reached, /message returns HTTP 409.",
+    )
+    session_ttl_hours: int = Field(48)
+    output_dir: str = Field("./canvas-output")
+    domain_patterns_dir: str = Field("./backend/canvas/domain_patterns")
+    validate_theme_on_write: bool = Field(True)
+    validate_skill_on_write: bool = Field(True)
+    cookie_name: str = Field(
+        "dynamoui_canvas",
+        description="Cookie name read by Canvas auth dep (mirrors the bearer JWT).",
+    )
+    cookie_secure: bool = Field(
+        False,
+        description=(
+            "Set Secure flag on the canvas auth cookie. MUST be True in any "
+            "production HTTPS deployment; defaults to False so dev (HTTP) "
+            "still works without extra config."
+        ),
+    )
+
+
 class FeatureFlagSettings(BaseSettings):
     """DYNAMO_FEATURE_* environment variables — cluster on/off switches for v2."""
 
@@ -293,6 +338,7 @@ llm_settings = LLMSettings()
 internal_settings = InternalSettings()
 verifier_settings = VerifierSettings()
 feature_settings = FeatureFlagSettings()
+canvas_settings = CanvasSettings()
 
 
 def configure_logging(settings: SkillRegistrySettings = skill_settings) -> None:

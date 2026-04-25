@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import secrets
 from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
@@ -12,27 +13,22 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from backend.sharing.models.tables import share_tokens
 
 
+# Tokens are 32 random bytes (256 bits of entropy) from ``secrets.token_urlsafe``.
+# A deterministic SHA-256 is safe: no dictionary attack applies, and it lets us
+# do an indexed equality lookup — avoiding a full-table scan on every resolve.
 def _hash_token(token: str) -> str:
-    # bcrypt would be ideal but would add a dependency; SHA-256 is enough
-    # given the token is 32 random bytes of entropy. If bcrypt is present we
-    # upgrade transparently.
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def _verify_bcrypt_legacy(token: str, stored: str) -> bool:
+    # Legacy path: tolerate bcrypt hashes left over from an earlier version.
     try:
         import bcrypt  # type: ignore
-
-        return bcrypt.hashpw(token.encode(), bcrypt.gensalt()).decode()
     except ImportError:
-        return hashlib.sha256(token.encode()).hexdigest()
-
-
-def _verify_token(token: str, stored: str) -> bool:
-    try:
-        import bcrypt  # type: ignore
-
-        if stored.startswith("$2"):
-            return bcrypt.checkpw(token.encode(), stored.encode())
-    except ImportError:
-        pass
-    return hashlib.sha256(token.encode()).hexdigest() == stored
+        return False
+    if not stored.startswith("$2"):
+        return False
+    return bcrypt.checkpw(token.encode(), stored.encode())
 
 
 class ShareTokenNotFound(Exception):
@@ -122,26 +118,51 @@ class ShareService:
 
     async def resolve(self, token: str) -> dict:
         """Resolve a token to its (source_type, source_id). Raises on invalid/expired."""
+        expected_hash = _hash_token(token)
         async with self._engine.begin() as conn:
-            rows = (
-                await conn.execute(sa.select(share_tokens))
-            ).mappings().all()
-            match = next((r for r in rows if _verify_token(token, r["token_hash"])), None)
-            if match is None:
+            row = (
+                await conn.execute(
+                    sa.select(share_tokens).where(
+                        share_tokens.c.token_hash == expected_hash
+                    )
+                )
+            ).mappings().first()
+            # Tolerate legacy bcrypt hashes via a single fallback scan only if
+            # the indexed lookup missed. Constant-time compare keeps timing flat.
+            if row is None:
+                legacy = (
+                    await conn.execute(
+                        sa.select(share_tokens).where(
+                            share_tokens.c.token_hash.like("$2%")
+                        )
+                    )
+                ).mappings().all()
+                row = next(
+                    (r for r in legacy if _verify_bcrypt_legacy(token, r["token_hash"])),
+                    None,
+                )
+            if row is None:
                 raise ShareTokenNotFound("invalid token")
-            if match["expires_at"] and match["expires_at"] < datetime.now(timezone.utc):
+            # Final belt-and-braces constant-time check on the canonical hash path.
+            if row["token_hash"].startswith("$2"):
+                ok = _verify_bcrypt_legacy(token, row["token_hash"])
+            else:
+                ok = hmac.compare_digest(row["token_hash"], expected_hash)
+            if not ok:
+                raise ShareTokenNotFound("invalid token")
+            if row["expires_at"] and row["expires_at"] < datetime.now(timezone.utc):
                 raise ShareExpired("token expired")
             if (
-                match["max_access_count"] is not None
-                and match["access_count"] >= match["max_access_count"]
+                row["max_access_count"] is not None
+                and row["access_count"] >= row["max_access_count"]
             ):
                 raise ShareExpired("token exhausted")
             await conn.execute(
                 sa.update(share_tokens)
-                .where(share_tokens.c.id == match["id"])
-                .values(access_count=match["access_count"] + 1)
+                .where(share_tokens.c.id == row["id"])
+                .values(access_count=row["access_count"] + 1)
             )
         return {
-            "sourceType": match["source_type"],
-            "sourceId": match["source_id"],
+            "sourceType": row["source_type"],
+            "sourceId": row["source_id"],
         }
